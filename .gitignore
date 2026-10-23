@@ -5,3 +5,8 @@ dist/
 .DS_Store
 __pycache__/
 *.samsungcontinuity
+.env
+.env.*
+!.env.example
+*.token
+*.dpapi

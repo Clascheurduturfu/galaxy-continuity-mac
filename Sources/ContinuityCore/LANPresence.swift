@@ -20,6 +20,7 @@ import Security
     /// Called once per authenticated device, before its session starts reading.
     public var opened: ((ClipboardSession) -> Void)?
     public var changed: (() -> Void)?
+    public var clipboardEnabled = true { didSet { sessions.forEach { $0.clipboardEnabled = clipboardEnabled } } }
     private var dialing = false
 
     public init(profile: ContinuityProfile) { self.profile = profile }
@@ -93,6 +94,7 @@ import Security
                 let opening = ClipboardSession(connection: transport, profile: profile)
                 session = opening
                 opened?(opening)
+                opening.clipboardEnabled = clipboardEnabled
                 try await opening.start(key: key, peer: responder.peerName, address: responder.peerAddress)
                 sessions.append(opening); changed?()
                 try await opening.run()
@@ -131,6 +133,7 @@ import Security
         do { try await session.connect() } catch { deadline.cancel(); session.stop(); return false }
         deadline.cancel()
         UserDefaults.standard.set("\(host):\(port)", forKey: "lan-endpoint-" + peer.address)
+        session.clipboardEnabled = clipboardEnabled
         sessions.append(session); changed?()
         Task {
             do { try await session.run() } catch { trace?("LAN session with \(peer.name) ended: \(error.localizedDescription)") }

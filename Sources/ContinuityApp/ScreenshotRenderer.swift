@@ -33,6 +33,7 @@ enum ScreenshotRenderer {
 
         model.profile = sampleProfile
         model.hasNativeSignIn = true
+        model.accountEmail = "demo@example.invalid"
         model.selectedTarget = "AA:BB:CC:11:22:01"
         model.connected = true
         model.autoConnect = true
@@ -48,7 +49,7 @@ enum ScreenshotRenderer {
             PairedBuds(id: "AA:BB:CC:33:44:55", name: "Galaxy Buds3 Pro"),
             PairedBuds(id: "AA:BB:CC:33:44:66", name: "Galaxy Buds2 Pro")
         ]
-        buds.selection = "AA:BB:CC:33:44:55"
+        buds.selection = buds.devices.first!.id
         buds.connected = true
         buds.automaticSwitching = true
         buds.peerStatus = "Buds connected · Mac audio active"
@@ -61,7 +62,9 @@ enum ScreenshotRenderer {
             (.home, "home-dashboard.png"),
             (.calls, "phone-calls.png"),
             (.buds, "galaxy-buds.png"),
-            (.storageAndControl, "storage-and-control.png")
+            (.nearby, "nearby-devices.png"),
+            (.multiControl, "multi-control.png"),
+            (.hotspots, "auto-hotspot.png")
         ]
 
         for (section, filename) in sections {
@@ -69,8 +72,10 @@ enum ScreenshotRenderer {
                 model: model,
                 buds: buds,
                 features: features,
+                hotspots: HotspotsModel(),
                 selectedSection: section
             )
+            .overlay(alignment: .bottomTrailing) { Text("Demo · fictional account and device state").font(.caption).padding(8).background(.ultraThinMaterial).padding(10) }
             .environment(\.colorScheme, .dark)
             .frame(width: 1040, height: 700)
 

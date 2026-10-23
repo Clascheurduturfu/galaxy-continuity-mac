@@ -62,6 +62,15 @@ public enum ClipboardContext {
     private var waitingImage: UInt8?
     private var waitingMetadata: (UInt8, Int)?
     public var receivedImage: ((Data) -> Void)?
+    /// The app's master switch gates clipboard traffic while keeping feature/control replies alive.
+    public var clipboardEnabled = true {
+        didSet {
+            guard clipboardEnabled != oldValue else { return }
+            if clipboardEnabled { if !key.isEmpty { installTransfer() }; return }
+            activeRemote = nil; waitingImage = nil; waitingMetadata = nil; pendingRemote = nil; pendingGetClip = nil
+            localClip = nil; transfer?.stop()
+        }
+    }
     public var eagerImages = true
     /// Diagnostic: fetch phone images with GET_CLIP to capture Samsung Keyboard's archive.
     public var captureClipArchives = false
@@ -115,17 +124,7 @@ public enum ClipboardContext {
         self.key = key; peerAddress = address
         let handover = CommandHandover(profile: profile, session: self); self.handover = handover
         handover.status = { [weak self] in self?.status?($0) }
-        let transfer = ClipboardTransfer(profile: profile, session: self); self.transfer = transfer
-        transfer.status = { [weak self] in self?.status?($0) }
-        transfer.receivedImage = { [weak self] data, sequence in
-            guard let self, self.activeRemote == sequence else { return }
-            self.activeRemote = nil; self.receivedImage?(data); self.status?("Received phone clipboard image (\(data.count) bytes).")
-        }
-        transfer.receivedClip = { [weak self] data, _ in self?.capturedClip?(data) }
-        transfer.receivedMetadata = { [weak self] data, sequence in
-            guard self?.activeRemote == sequence else { return }
-            do { try self?.receiveMetadata(data) } catch { self?.status?(error.localizedDescription) }
-        }
+        if clipboardEnabled { installTransfer() }
         status?("Authenticated directly with \(peer ?? "Samsung device").")
         try await send(handler: 100, command: MCFCommand(id: 3, type: 1, payload: Data([1])))
         try await send(handler: 100, command: MCFCommand(id: 9, type: 1))
@@ -134,7 +133,21 @@ public enum ClipboardContext {
             try await observe(context, advertisement: true)
         }
     }
+    private func installTransfer() {
+        let transfer = ClipboardTransfer(profile: profile, session: self); self.transfer = transfer
+        transfer.status = { [weak self] in self?.status?($0) }
+        transfer.receivedImage = { [weak self] data, sequence in
+            guard let self, self.clipboardEnabled, self.activeRemote == sequence else { return }
+            self.activeRemote = nil; self.receivedImage?(data); self.status?("Received phone clipboard image (\(data.count) bytes).")
+        }
+        transfer.receivedClip = { [weak self] data, _ in self?.capturedClip?(data) }
+        transfer.receivedMetadata = { [weak self] data, sequence in
+            guard self?.clipboardEnabled == true, self?.activeRemote == sequence else { return }
+            do { try self?.receiveMetadata(data) } catch { self?.status?(error.localizedDescription) }
+        }
+    }
     public func publish(_ text: String, html: String? = nil) async throws {
+        guard clipboardEnabled else { return }
         guard !key.isEmpty else { throw ContinuityError.message("Connect before sending clipboard text.") }
         guard text.utf8.count + (html?.utf8.count ?? 0) <= 900000 else { throw ContinuityError.message("Clipboard text and HTML exceed the metadata limit.") }
         guard guardState.shouldPublish(text) else { return }
@@ -150,6 +163,7 @@ public enum ClipboardContext {
         status?("Announced Mac text. Waiting for the phone's metadata request…")
     }
     public func publishImage(_ data: Data, fileName: String = "image.png") async throws {
+        guard clipboardEnabled else { return }
         guard !key.isEmpty else { throw ContinuityError.message("Connect before sending clipboard images.") }
         try ClipboardDataWire.validateImage(data)
         guard ["image.png", "image.jpg", "image.heic"].contains(fileName) else { throw ContinuityError.message("Unsupported clipboard image name.") }
@@ -169,6 +183,7 @@ public enum ClipboardContext {
         status?("Announced Mac image. Waiting for the phone's transfer request…")
     }
     private func receiveMetadata(_ compressed: Data) throws {
+        guard clipboardEnabled else { return }
         let json = try ClipboardCompression.gzip(compressed, decompress: true)
         let clip = try JSONDecoder().decode(ClipboardText.self, from: json)
         if ["TEXT", "HTML"].contains(clip.type) {
@@ -188,6 +203,7 @@ public enum ClipboardContext {
         let sequence = event.sequence
         trace?("CLIPBOARD EVENT sequence=\(sequence) kind=\(event.kind) flags=\(event.flags)")
         lastRequested = sequence
+        guard clipboardEnabled else { return }
         // Do not replace a fresh local copy with an older peer context attached
         // to its metadata request. A subsequent phone copy has a new sequence.
         guard advertisement || Date().timeIntervalSince(publishedAt) >= 2 else { suppressedSequence = sequence; return }
@@ -205,6 +221,7 @@ public enum ClipboardContext {
         try await send(handler: 2, command: MCFCommand(id: 4, type: 1, payload: Data([sequence])))
     }
     private func send(handler: UInt64, command: MCFCommand) async throws {
+        guard handler != 2 || clipboardEnabled else { return }
         packetSequence += 1
         contextSequence = contextSequence >= 62 ? 1 : contextSequence + 1
         UserDefaults.standard.set(Int(contextSequence), forKey: preferenceKey + "-context")
@@ -244,10 +261,10 @@ public enum ClipboardContext {
         }
         trace?("RECEIVE handler=\(handler) command=\(command.id) type=\(command.type) bytes=\(command.payload.count) contextBytes=\(context.count)")
         try await observe(context)
-        if handler == 6, command.id == 1, command.type == 1, command.payload.first == 102 { transfer?.acceptFeatureRequest() }
+        if clipboardEnabled, handler == 6, command.id == 1, command.type == 1, command.payload.first == 102 { transfer?.acceptFeatureRequest() }
         if handler == 6 { clientCommandReceived?(command); for callback in Array(clientHandlers.values) { callback(command) } }
         if handler == 100 {
-            if command.id == 2 { transfer?.handle(command, reply: reply); return }
+            if command.id == 2 { if clipboardEnabled { transfer?.handle(command, reply: reply) }; return }
             if command.type == 1 && [6, 9].contains(command.id) { try await send(handler: 100, command: MCFCommand(id: command.id, type: 2)) }
             else if command.type == 1 && command.id == 1 {
                 tcpOfferReceived?(command.payload)
@@ -270,7 +287,7 @@ public enum ClipboardContext {
             }
             return
         }
-        guard handler == 2 else { return }
+        guard handler == 2, clipboardEnabled else { return }
         if command.id == 1, command.type == 1, let sequence = command.payload.first {
             // GET_CLIP: [id, 1] + bytes inline below 20 KiB, else [id, 7] + length
             // and the phone opens a data channel that carries only raw chunks.

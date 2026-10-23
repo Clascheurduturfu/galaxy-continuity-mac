@@ -5,8 +5,20 @@ public struct PairedBuds: Identifiable, Sendable {
     public let id: String
     public let name: String
     public init(id: String, name: String) {
-        self.id = id
+        self.id = Self.canonicalID(id)
         self.name = name
+    }
+    public static func canonicalID(_ value: String) -> String {
+        let hex = value.filter { $0.isHexDigit }.uppercased()
+        guard hex.count == 12 else { return value.uppercased() }
+        return stride(from: 0, to: 12, by: 2).map { offset in
+            let start = hex.index(hex.startIndex, offsetBy: offset)
+            return String(hex[start..<hex.index(start, offsetBy: 2)])
+        }.joined(separator: "-")
+    }
+    public static func unique(_ values: [PairedBuds]) -> [PairedBuds] {
+        var seen = Set<String>()
+        return values.filter { seen.insert(canonicalID($0.id)).inserted }
     }
 }
 
@@ -31,7 +43,7 @@ public struct PairedBuds: Identifiable, Sendable {
     }
     public static func pairedDevices() -> [PairedBuds] {
         let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
-        return devices.compactMap { device in
+        return PairedBuds.unique(devices.compactMap { device in
             guard let address = device.addressString, let name = device.name else { return nil }
             let samsungService = services.prefix(2).contains { text in
                 guard let uuid = uuid(text) else { return false }
@@ -39,7 +51,7 @@ public struct PairedBuds: Identifiable, Sendable {
             }
             guard name.localizedCaseInsensitiveContains("buds") || samsungService else { return nil }
             return PairedBuds(id: address, name: name)
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
     public static func disconnectPairedDevice(address: String) throws {
         guard let selected = IOBluetoothDevice(addressString: address), selected.isPaired() else {

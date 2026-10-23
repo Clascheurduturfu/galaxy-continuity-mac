@@ -1,0 +1,35 @@
+name: Publish requested release
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel (run this workflow on its matching branch)
+        type: choice
+        options: [preview, stable]
+        default: preview
+permissions:
+  contents: write
+jobs:
+  release:
+    if: (inputs.channel == 'preview' && github.ref == 'refs/heads/preview') || (inputs.channel == 'stable' && github.ref == 'refs/heads/main')
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: bash scripts/build-macos.sh
+      - name: Package authored offline sources and app
+        run: python3 scripts/package-release.py
+      - name: Publish to the selected branch's feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+        shell: bash
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Galaxy Continuity Lab.app/Contents/Info.plist')
+          branch=main
+          flags=()
+          if [[ "$CHANNEL" == preview ]]; then branch=preview; flags+=(--prerelease); fi
+          if [[ "$CHANNEL" == stable && "$version" == *-* ]]; then echo 'Stable releases require a final version.'; exit 1; fi
+          gh release create "v$version" --target "$branch" --title "Galaxy Continuity $version" --generate-notes "${flags[@]}" \
+            "dist/GalaxyContinuity-$version-macOS-arm64.zip" \
+            "dist/GalaxyContinuity-$version-offline-source.zip" "dist/SHA256SUMS-$version.txt"

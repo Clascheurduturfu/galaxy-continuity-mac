@@ -8,6 +8,7 @@ import CoreLocation
     public var progress: ((String) -> Void)?
     public override init() { super.init() }
     public func join(_ credentials: HotspotCredentials) async throws {
+        try Task.checkCancellation()
         guard permission == nil else { throw ContinuityError.message("A Wi-Fi permission request is already pending.") }
         let manager = CLLocationManager(); location = manager; manager.delegate = self
         progress?("Wi-Fi location authorization state: \(manager.authorizationStatus.rawValue).")
@@ -20,8 +21,10 @@ import CoreLocation
             throw ContinuityError.message("Allow Galaxy Continuity Lab in System Settings → Privacy & Security → Location Services so macOS can find the phone's Wi-Fi network.")
         }
         for attempt in 0..<4 {
+            try Task.checkCancellation()
             do { try await Task.detached { try credentials.join() }.value; return }
             catch {
+                if Task.isCancelled { throw CancellationError() }
                 if attempt == 3 { throw error }
                 progress?("Waiting for the phone's hotspot to become visible…")
                 try await Task.sleep(nanoseconds: 2_000_000_000)

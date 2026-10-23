@@ -214,6 +214,7 @@ final class PointerCaptureEngine: @unchecked Sendable {
     private(set) var active = false
     var failed: ((String) -> Void)?
     var summary: ((String) -> Void)?
+    var ended: (() -> Void)?
     func start(_ controller: MultiControl) throws {
         guard !active else { return }
         guard AXIsProcessTrusted() else {
@@ -261,6 +262,7 @@ final class PointerCaptureEngine: @unchecked Sendable {
         consumer?.cancel(); consumer = nil; queue?.finish(); queue = nil; engine = nil
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }; sleepObserver = nil
         _ = CGAssociateMouseAndMouseCursorPosition(1); _ = CGDisplayShowCursor(CGMainDisplayID())
+        ended?()
         let controller = controller; self.controller = nil
         Task { await controller?.release() }
     }

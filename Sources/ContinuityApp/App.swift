@@ -23,7 +23,9 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     case clipboard = "Clipboard"
     case calls = "Phone Calls"
     case buds = "Galaxy Buds"
-    case storageAndControl = "Storage & Control"
+    case nearby = "Nearby Devices"
+    case multiControl = "Multi Control"
+    case hotspots = "Auto Hotspot"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -34,7 +36,9 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         case .clipboard: return "doc.on.clipboard.fill"
         case .calls: return "phone.fill"
         case .buds: return "earbuds"
-        case .storageAndControl: return "rectangle.connected.to.line.below"
+        case .nearby: return "dot.radiowaves.left.and.right"
+        case .multiControl: return "rectangle.connected.to.line.below"
+        case .hotspots: return "personalhotspot"
         case .settings: return "gearshape.fill"
         }
     }
@@ -47,6 +51,8 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     @Published var status = "Sign in with Samsung, or import a Galaxy Connect connection."
     @Published var signingIn = false
     @Published var hasNativeSignIn = false
+    @Published var accountEmail = ""
+    private var started = false
     @Published var profile: ContinuityProfile?
     @Published var pending: Data?
     @Published var code = ""
@@ -55,17 +61,24 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     @Published var hotspotBusy = false
     /// On by default and remembered, like Samsung's own clipboard sharing.
     @Published var automaticClipboard = UserDefaults.standard.object(forKey: "automaticClipboard") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(automaticClipboard, forKey: "automaticClipboard") }
+        didSet {
+            guard !AppVersion.isRenderingDemo, !AppVersion.isWindowSelfTest else { return }
+            UserDefaults.standard.set(automaticClipboard, forKey: "automaticClipboard")
+            lastChange = NSPasteboard.general.changeCount
+            for link in [session].compactMap({ $0 }) + clipboardSessions { link.clipboardEnabled = automaticClipboard }
+            lanPresence?.clipboardEnabled = automaticClipboard
+            updateClipboardPool()
+        }
     }
     /// Smart Galaxy Book-style automatic phone connection on launch, wake, and proximity.
     @Published var autoConnect = UserDefaults.standard.object(forKey: "continuity.autoConnect") as? Bool ?? true {
         didSet {
+            guard !AppVersion.isRenderingDemo else { return }
             UserDefaults.standard.set(autoConnect, forKey: "continuity.autoConnect")
             if autoConnect && !userPaused && !connected && !busy {
                 triggerSmartConnect(reason: "auto-connect enabled")
-            } else if !autoConnect {
-                cancelReconnectTimer()
-            }
+            } else if !autoConnect { cancelReconnectTimer() }
+            updateClipboardPool()
         }
     }
     @Published var clipboardNotifications = UserDefaults.standard.object(forKey: "continuity.clipboardNotifications") as? Bool ?? false {
@@ -81,6 +94,14 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     @Published var lastClipboardDirection = ""
     @Published var lastClipboardDate: Date?
     @Published var selectedTarget = ""
+    let nearbyClipboard = NearbyClipboardPool()
+    @Published var clipboardPeerNames: [String] = []
+    var clipboardSessions: [ClipboardSession] { [session].compactMap { $0 }.filter { connected && $0.peerAddress != nil } + nearbyClipboard.sessions + (lanPresence?.sessions ?? []) }
+    var hasClipboardLinks: Bool { !clipboardSessions.isEmpty }
+    func clipboardSession(for address: String) -> ClipboardSession? {
+        guard let bytes = try? ContinuityProfile.addressBytes(address) else { return nil }
+        return clipboardSessions.first { (try? ContinuityProfile.addressBytes($0.peerAddress ?? "")) == bytes }
+    }
     var session: ClipboardSession?
     var sessionTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
@@ -140,6 +161,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func start() {
+        guard !started else { return }; started = true
         launchAtLogin = SMAppService.mainApp.status == .enabled
         hotspotJoiner.progress = { [weak self] in self?.note($0) }
         discovery.changed = { [weak self] devices in
@@ -157,10 +179,19 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             guard let self else { return }
             self.nearbyPeers = peers
             self.evaluateProximityAutoConnect(peers)
+            self.updateClipboardPool()
         }
         discovery.bluetoothStatus = { [weak self] in self?.discoveryStatus = $0 }
         discovery.failed = { [weak self] in self?.status = $0 }
 
+        nearbyClipboard.opened = { [weak self] link, name in
+            guard let self else { return }
+            link.clipboardEnabled = self.automaticClipboard
+            link.trace = { [weak self] in self?.trace($0) }
+            self.receiveClipboard(from: link, name: name)
+        }
+        nearbyClipboard.changed = { [weak self] in self?.updateNearbyConnections() }
+        nearbyClipboard.status = { [weak self] in self?.trace($0) }
         installSystemObservers()
 
         let args = CommandLine.arguments
@@ -196,6 +227,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             let savedSignIn = await Task.detached { (try? signInService.hasStoredSignIn()) ?? false }.value
             guard !Task.isCancelled else { return }
             hasNativeSignIn = savedSignIn
+            accountEmail = (try? signInService.signedInAccountLabel()) ?? ""
             if args.contains("--start-sign-in") { signIn() }
             if args.contains("--refresh-sign-in") { signIn(refresh: true) }
             if args.contains("--start-probe") || (autoConnect && profile != nil && !userPaused) {
@@ -206,7 +238,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         }
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.automaticClipboard, self.connected || !self.lanPeers.isEmpty, self.lastChange != NSPasteboard.general.changeCount else { return }
+                guard let self, self.automaticClipboard, self.hasClipboardLinks, self.lastChange != NSPasteboard.general.changeCount else { return }
                 self.lastChange = NSPasteboard.general.changeCount; self.sendClipboard()
             }
         }
@@ -258,6 +290,13 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         }
     }
 
+    func updateClipboardPool() {
+        guard started else { return }
+        nearbyClipboard.update(profile: profile, peers: nearbyPeers,
+            excluding: selectedTarget.isEmpty ? [] : [selectedTarget],
+            enabled: autoConnect && !userPaused && !signingIn, sharing: automaticClipboard)
+    }
+
     private func evaluateProximityAutoConnect(_ peers: [NearbyPeer]) {
         guard autoConnect, !userPaused, !connected, !busy, !signingIn, profile != nil else { return }
         if let target = peers.first(where: { $0.address.caseInsensitiveCompare(selectedTarget) == .orderedSame }),
@@ -279,7 +318,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     func pauseConnection() {
         userPaused = true
         cancelReconnectTimer()
-        disconnect()
+        disconnect(); nearbyClipboard.stop(); updateNearbyConnections()
         note("Automatic connection paused. Click Resume whenever you're ready.")
     }
 
@@ -353,6 +392,10 @@ enum SidebarSection: String, CaseIterable, Identifiable {
 
     func connectBluetooth() {
         guard var profile, !busy, !connected, !signingIn else { return }
+        if !CommandLine.arguments.contains("--peer"),
+           let nearby = nearbyPeers.first(where: { $0.bluetoothConnectable && ["phone", "tablet", "tab"].contains($0.deviceType?.lowercased() ?? "") && !nearbyClipboard.connectedAddresses.contains($0.id) }),
+           !nearbyPeers.contains(where: { $0.address == selectedTarget && $0.bluetoothConnectable }) { selectedTarget = nearby.address }
+        updateClipboardPool()
         cancelReconnectTimer()
         do {
             if !selectedTarget.isEmpty {
@@ -374,7 +417,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     func signIn(refresh: Bool = false) {
         guard !signingIn else { return }; startupTask?.cancel(); pauseConnection(); userPaused = false; signingIn = true
         Task {
-            defer { signingIn = false; hasNativeSignIn = (try? ContinuitySignIn.shared.hasStoredSignIn()) ?? false }
+            defer { signingIn = false; hasNativeSignIn = (try? ContinuitySignIn.shared.hasStoredSignIn()) ?? false; accountEmail = (try? ContinuitySignIn.shared.signedInAccountLabel()) ?? "" }
             do {
                 var value: ContinuityProfile
                 if refresh { value = try await ContinuitySignIn.shared.refresh(status: note, renewTokens: CommandLine.arguments.contains("--refresh-sign-in")) }
@@ -391,9 +434,9 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func signOut() {
-        guard !signingIn else { return }; startupTask?.cancel(); cancelReconnectTimer(); disconnect()
+        guard !signingIn else { return }; startupTask?.cancel(); cancelReconnectTimer(); disconnect(); nearbyClipboard.stop(); lanPresence?.stop(); lanPresence = nil
         do {
-            try ContinuitySignIn.shared.signOut(); hasNativeSignIn = false
+            try ContinuitySignIn.shared.signOut(); hasNativeSignIn = false; accountEmail = ""
             if profile?.borrowedIdentity == false { try ProfileStore.delete(); profile = nil; discovery.profile = nil; devices = [] }
             note("Samsung account sign-in removed from this app. A saved Windows import, if active, is retained.")
         } catch { note(error.localizedDescription) }
@@ -409,6 +452,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 try await Task.detached { try ContinuityLoginStorage.importKeychainForTesting() }.value
                 profile = try ProfileStore.load(); discovery.profile = profile
                 hasNativeSignIn = try ContinuitySignIn.shared.hasStoredSignIn()
+                accountEmail = (try? ContinuitySignIn.shared.signedInAccountLabel()) ?? ""
                 if let profile { selectedTarget = selectBestTarget(for: profile); startLANPresence(profile) }
                 discovery.stop(); devices = []; discovery.start()
                 note("Login copied to private files. Future builds won't read Keychain.")
@@ -418,7 +462,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func begin(_ session: ClipboardSession) {
-        self.session = session; busy = true
+        self.session = session; session.clipboardEnabled = automaticClipboard; busy = true
         session.status = { [weak self] in self?.note($0) }
         session.trace = { [weak self] in self?.trace($0) }
         session.eagerImages = !CommandLine.arguments.contains("--lazy-images")
@@ -452,17 +496,17 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         sessionTask = Task {
             defer {
                 let shouldRetry = !Task.isCancelled && !userPaused && autoConnect && profile != nil
-                busy = false
-                connected = false
                 session.stop()
-                updateNearbyConnections()
-                if shouldRetry {
-                    scheduleReconnect()
+                if self.session === session {
+                    busy = false; connected = false
+                    updateNearbyConnections()
+                    if shouldRetry { scheduleReconnect() }
                 }
             }
             do {
                 // Only copies made after connecting are shared, not whatever was already on the clipboard.
                 try await session.connect()
+                session.clipboardEnabled = automaticClipboard
                 lastChange = NSPasteboard.general.changeCount
                 connected = true
                 busy = false
@@ -496,24 +540,26 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         }
     }
 
-    func receiveClipboard(from session: ClipboardSession) {
-        session.received = { [weak self] clip in
-            guard let self else { return }
+    func receiveClipboard(from session: ClipboardSession, name: String? = nil) {
+        session.clipboardEnabled = automaticClipboard
+        let peerName = name ?? targetDisplayName
+        session.received = { [weak self, weak session] clip in
+            guard let self, self.automaticClipboard, session?.clipboardEnabled == true else { return }
             self.receivedText = clip.text
             self.receivedImage = nil
             self.receivedImageBytes = 0
-            self.lastClipboardDirection = "From \(self.targetDisplayName)"
+            self.lastClipboardDirection = "From \(peerName)"
             self.lastClipboardDate = Date()
             let board = NSPasteboard.general; board.clearContents(); board.setString(clip.text, forType: .string)
             if let html = clip.html { board.setString(html, forType: .html) }
             self.lastChange = board.changeCount; self.note("Received phone text and placed it on the Mac clipboard.")
-            self.notifyClipboardArrival(summary: "Text copied from \(self.targetDisplayName)")
+            self.notifyClipboardArrival(summary: "Text copied from \(peerName)")
         }
-        session.receivedImage = { [weak self] data in
-            guard let self, let image = NSImage(data: data) else { return }
+        session.receivedImage = { [weak self, weak session] data in
+            guard let self, self.automaticClipboard, session?.clipboardEnabled == true, let image = NSImage(data: data) else { return }
             self.receivedImage = image
             self.receivedImageBytes = data.count
-            self.lastClipboardDirection = "From \(self.targetDisplayName)"
+            self.lastClipboardDirection = "From \(peerName)"
             self.lastClipboardDate = Date()
             // Keep the phone's original JPEG/HEIC/PNG bytes, plus TIFF for apps that need it.
             let item = NSPasteboardItem()
@@ -523,7 +569,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
             let board = NSPasteboard.general; board.clearContents(); board.writeObjects([item])
             self.lastChange = board.changeCount; self.note("Received phone image and placed it on the Mac clipboard.")
-            self.notifyClipboardArrival(summary: "Image (\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))) copied from \(self.targetDisplayName)")
+            self.notifyClipboardArrival(summary: "Image (\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))) copied from \(peerName)")
         }
     }
 
@@ -541,13 +587,15 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func startLANPresence(_ profile: ContinuityProfile) {
-        guard lanPresence == nil, !CommandLine.arguments.contains("--no-lan-pcs") else { return }
+        guard !CommandLine.arguments.contains("--no-lan-pcs") else { return }
+        lanPresence?.stop(); lanTimer?.invalidate(); lanTimer = nil
         let presence = LANPresence(profile: profile)
+        presence.clipboardEnabled = automaticClipboard
         presence.status = { [weak self] in self?.note($0) }
         presence.trace = { [weak self] in self?.trace($0) }
         presence.opened = { [weak self] session in
             session.status = { self?.note($0) }; session.trace = { self?.trace($0) }
-            self?.receiveClipboard(from: session)
+            self?.receiveClipboard(from: session, name: "Galaxy Book")
         }
         presence.changed = { [weak self, weak presence] in
             let names = Set(presence?.connectedPeers ?? [])
@@ -562,7 +610,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
 
     /// Sends one clipboard change to the phone and to every connected Galaxy PC.
     private func share(_ action: @escaping (ClipboardSession) async throws -> Void) {
-        for target in [session].compactMap({ $0 }) + (lanPresence?.sessions ?? []) {
+        for target in clipboardSessions {
             Task { do { try await action(target) } catch { note(error.localizedDescription) } }
         }
     }
@@ -570,6 +618,8 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     func updateNearbyConnections() {
         var addresses = lanPresence?.connectedPeers ?? []
         if connected, let address = session?.peerAddress { addresses.append(address) }
+        addresses += nearbyClipboard.sessions.compactMap(\.peerAddress)
+        clipboardPeerNames = addresses.compactMap { address in profile?.peers.first(where: { (try? ContinuityProfile.addressBytes($0.address)) == (try? ContinuityProfile.addressBytes(address)) })?.name }
         discovery.setConnectedPeers(addresses)
     }
 
@@ -583,7 +633,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func sendClipboard() {
-        guard session != nil || !(lanPresence?.sessions.isEmpty ?? true) else { return }
+        guard automaticClipboard, hasClipboardLinks else { return }
         let board = NSPasteboard.general
         // A single image file copied in Finder sends the image, not its name.
         if let urls = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], urls.count == 1,
@@ -654,17 +704,20 @@ struct LabView: View {
     @ObservedObject var model: LabModel
     @ObservedObject var buds: BudsModel
     @ObservedObject var features: FeaturesModel
+    @ObservedObject var hotspots: HotspotsModel
+    @Environment(\.openWindow) private var openWindow
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @ObservedObject private var calls = CallingController.shared
     @State var selectedSection: SidebarSection = {
         let args = CommandLine.arguments
         if args.contains("--buds-probe") { return .buds }
-        if args.contains("--feature-test") || args.contains("--multi-test") { return .storageAndControl }
+        if args.contains("--feature-test") || args.contains("--multi-test") { return .multiControl }
         return .home
     }()
     @State private var importing = false
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
                     ZStack {
@@ -687,7 +740,9 @@ struct LabView: View {
                 .padding(.top, 8)
 
                 List(SidebarSection.allCases, selection: $selectedSection) { section in
-                    Label(section.rawValue, systemImage: section.symbol)
+                    Label { Text(section.rawValue) } icon: {
+                        Image(systemName: section.symbol).foregroundStyle(selectedSection == section ? Color.white : Color.secondary)
+                    }
                         .font(.system(size: 13, weight: .medium))
                         .tag(section)
                 }
@@ -720,24 +775,31 @@ struct LabView: View {
                     CallsPanel()
                 case .buds:
                     BudsPanel(model: buds)
-                case .storageAndControl:
-                    if let profile = model.profile {
-                        FeaturesPanel(
-                            model: features,
-                            profile: profile,
-                            device: model.devices.first(where: { $0.address == model.selectedTarget })
-                        )
-                    } else {
-                        SignInPromptCard(model: model)
-                    }
+                case .nearby:
+                    NearbyDevicesPage(model: model, features: features, section: $selectedSection)
+                case .multiControl:
+                    MultiControlPage(model: model, features: features)
+                case .hotspots:
+                    HotspotsPage(model: model, hotspots: hotspots)
                 case .settings:
-                    SettingsPageView(model: model, importing: $importing)
+                    SettingsPageView(model: model, features: features, importing: $importing)
                 }
             }
         }
-        .frame(minWidth: 880, minHeight: 620)
+        .navigationSplitViewStyle(.balanced)
+        .background(MainWindowAttachment())
+        .frame(minWidth: 900, minHeight: 640)
+        .onAppear {
+            guard !AppVersion.isRenderingDemo else { return }
+            AppWindowPolicy.shared.createWindow = { openWindow(id: "main") }
+            AppWindowPolicy.shared.selectSection = { selectedSection = $0 }
+            if let pending = AppWindowPolicy.shared.takePendingSection() { selectedSection = pending }
+            AppWindowPolicy.shared.displayedSection = selectedSection
+        }
+        .onChange(of: selectedSection) { AppWindowPolicy.shared.displayedSection = $0 }
         .onChange(of: model.connected) { isConnected in
             features.sharedCommand = isConnected ? model.session : nil
+            features.sharedCommandPeerAddress = isConnected ? model.selectedTarget : nil
         }
         .onChange(of: model.profile != nil) { available in
             if available, CommandLine.arguments.contains("--feature-test"), let profile = model.profile {
@@ -842,7 +904,7 @@ struct HomePageView: View {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
                         OneUIQuickTile(
                             title: "Clipboard Sync",
-                            subtitle: model.automaticClipboard ? "Auto-sync On" : "Manual only",
+                            subtitle: model.automaticClipboard ? "All nearby devices" : "Sync off",
                             symbol: "doc.on.clipboard.fill",
                             isOn: model.automaticClipboard
                         ) {
@@ -851,13 +913,13 @@ struct HomePageView: View {
 
                         OneUIQuickTile(
                             title: "Auto Hotspot",
-                            subtitle: model.hotspotBusy ? "Joining Wi-Fi…" : (model.connected ? "Tap to tether" : "Connect phone first"),
+                            subtitle: "Choose a nearby hotspot",
                             symbol: "personalhotspot",
                             isOn: model.hotspotBusy,
                             isBusy: model.hotspotBusy,
-                            isDisabled: !model.connected || model.hotspotBusy
+                            isDisabled: model.profile == nil
                         ) {
-                            model.hotspot()
+                            selectedSection = .hotspots
                         }
 
                         OneUIQuickTile(
@@ -896,7 +958,7 @@ struct HomePageView: View {
                             isBusy: features.busy
                         ) {
                             features.sharedCommand = model.connected ? model.session : nil
-                            selectedSection = .storageAndControl
+                            selectedSection = .nearby
                         }
 
                         OneUIQuickTile(
@@ -907,7 +969,7 @@ struct HomePageView: View {
                             isBusy: features.busy
                         ) {
                             features.sharedCommand = model.connected ? model.session : nil
-                            selectedSection = .storageAndControl
+                            selectedSection = .multiControl
                         }
                     }
                 }
@@ -986,7 +1048,7 @@ private struct HeroDeviceCard: View {
 
                         HStack(spacing: 8) {
                             OneUIStatusPill(
-                                model.connected ? "Bluetooth L2CAP" : (model.autoConnect ? "Smart Auto-Connect" : "Manual Mode"),
+                                model.connected ? "Bluetooth" : (model.autoConnect ? "Smart Auto-Connect" : "Manual Mode"),
                                 tone: model.connected ? .connected : .active,
                                 symbol: "antenna.radiowaves.left.and.right"
                             )
@@ -998,7 +1060,7 @@ private struct HeroDeviceCard: View {
                                 )
                             }
                             if calls.phase == .registered {
-                                OneUIStatusPill("CMC Calling Ready", tone: .connected, symbol: "phone.fill")
+                                OneUIStatusPill("Calls Ready", tone: .connected, symbol: "phone.fill")
                             }
                         }
                         .padding(.top, 2)
@@ -1031,26 +1093,7 @@ private struct HeroDeviceCard: View {
                             .disabled(model.signingIn)
                         }
 
-                        if let profile = model.profile, profile.peers.count > 1 {
-                            Menu {
-                                ForEach(profile.peers, id: \.address) { peer in
-                                    Button {
-                                        model.selectPeerAndConnect(peer.address)
-                                    } label: {
-                                        HStack {
-                                            Text(peer.name)
-                                            if peer.address == model.selectedTarget {
-                                                Image(systemName: "checkmark")
-                                            }
-                                        }
-                                    }
-                                }
-                            } label: {
-                                Label("Switch Device", systemImage: "arrow.triangle.2.circlepath")
-                                    .font(.system(size: 12, weight: .medium))
-                            }
-                            .menuStyle(.borderlessButton)
-                        }
+
                     }
                 }
             }
@@ -1125,7 +1168,7 @@ private struct RecentClipboardCard: View {
                         model.sendClipboard()
                     }
                     .buttonStyle(OneUIPrimaryButtonStyle())
-                    .disabled(!model.connected && model.lanPeers.isEmpty)
+                    .disabled(!model.automaticClipboard || !model.hasClipboardLinks)
 
                     Button("Open Clipboard View") {
                         selectedSection = .clipboard
@@ -1144,22 +1187,22 @@ private struct NearbyEcosystemCard: View {
         OneUICard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Label("Your Samsung Devices", systemImage: "dot.radiowaves.left.and.right")
+                    Label("Nearby Devices", systemImage: "dot.radiowaves.left.and.right")
                         .font(.system(size: 15, weight: .bold, design: .rounded))
                     Spacer()
-                    Text("\(model.nearbyPeers.count)")
+                    Text("\(model.nearbyPeers.filter(\.nearby).count)")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(.secondary)
                 }
 
-                if model.nearbyPeers.isEmpty {
-                    Text("Sign in with Samsung to load your registered phones, tablets and Galaxy Books.")
+                if model.nearbyPeers.filter(\.nearby).isEmpty {
+                    Text("No nearby device detected. Turn on Bluetooth on your Galaxy devices.")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 90, alignment: .center)
                 } else {
                     VStack(spacing: 8) {
-                        ForEach(model.nearbyPeers) { peer in
+                        ForEach(model.nearbyPeers.filter(\.nearby).prefix(4)) { peer in
                             HStack(spacing: 12) {
                                 ZStack {
                                     Circle()
@@ -1172,7 +1215,7 @@ private struct NearbyEcosystemCard: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(peer.name)
                                         .font(.system(size: 13, weight: .semibold))
-                                    Text(peer.summary)
+                                    Text(peer.connected ? "Connected" : peer.bluetoothNearby ? "Nearby over Bluetooth" : "Found on local network")
                                         .font(.system(size: 11))
                                         .foregroundStyle(.secondary)
                                 }
@@ -1183,7 +1226,7 @@ private struct NearbyEcosystemCard: View {
                                     Button("Verify") { model.probe(endpoint) }
                                         .buttonStyle(OneUISecondaryButtonStyle())
                                         .disabled(model.busy || model.signingIn)
-                                } else if peer.bluetoothConnectable || peer.address != model.selectedTarget {
+                                } else if peer.nearby {
                                     Button("Connect") {
                                         model.selectPeerAndConnect(peer.address)
                                     }
@@ -1206,8 +1249,8 @@ struct ClipboardPageView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                OneUIPageHeader("Clipboard Continuity", subtitle: "Copy text, rich HTML or photos on one device and paste on the other") {
-                    OneUIStatusPill(model.automaticClipboard ? "Auto-Sync Enabled" : "Manual Mode", tone: model.automaticClipboard ? .connected : .neutral)
+                OneUIPageHeader("Clipboard Continuity", subtitle: "Copy text, rich HTML or photos between your nearby Galaxy devices and Mac") {
+                    OneUIStatusPill(model.automaticClipboard ? "Sync Enabled" : "Sync Off", tone: model.automaticClipboard ? .connected : .neutral)
                 }
 
                 OneUICard {
@@ -1215,7 +1258,7 @@ struct ClipboardPageView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Sync Text & Images Automatically")
                                 .font(.system(size: 16, weight: .bold, design: .rounded))
-                            Text("Watches NSPasteboard while connected and shares new copies with your Galaxy phone and any connected Galaxy Book on the local network.")
+                            Text("Automatically connects nearby phones and tablets on your Samsung account, plus Galaxy Books on the local network. Turning this off stops sending and receiving clipboard items.")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                         }
@@ -1236,7 +1279,7 @@ struct ClipboardPageView: View {
                                 model.sendClipboard()
                             }
                             .buttonStyle(OneUIPrimaryButtonStyle())
-                            .disabled(!model.connected && model.lanPeers.isEmpty)
+                            .disabled(!model.automaticClipboard || !model.hasClipboardLinks)
                         }
 
                         if let image = model.receivedImage {
@@ -1272,6 +1315,7 @@ struct ClipboardPageView: View {
 
 struct SettingsPageView: View {
     @ObservedObject var model: LabModel
+    @ObservedObject var features: FeaturesModel
     @Binding var importing: Bool
     @State private var showAdvanced = false
 
@@ -1294,9 +1338,12 @@ struct SettingsPageView: View {
                                     .foregroundStyle(.white)
                             }
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Samsung Account & Mac Identity")
+                                Text("Samsung Account")
                                     .font(.system(size: 17, weight: .bold, design: .rounded))
-                                Text(model.profile == nil ? "Not enrolled yet — sign in with your Samsung account." : (model.profile?.borrowedIdentity == true ? "Using an imported Windows registration." : "Enrolled with an independent native Mac certificate."))
+                                if !model.accountEmail.isEmpty {
+                                    Text(model.accountEmail).font(.callout).textSelection(.enabled)
+                                }
+                                Text(model.profile == nil ? "Not enrolled yet — sign in with your Samsung account." : (model.profile?.borrowedIdentity == true ? "Signed in using an imported connection." : "Signed in on this Mac."))
                                     .font(.system(size: 12))
                                     .foregroundStyle(.secondary)
                             }
@@ -1335,34 +1382,26 @@ struct SettingsPageView: View {
                         Text("Smart Connection & Startup")
                             .font(.system(size: 16, weight: .bold, design: .rounded))
 
-                        Toggle("Connect to your Galaxy phone automatically (launch, wake & proximity)", isOn: $model.autoConnect)
+                        Toggle("Connect nearby Galaxy devices automatically (launch, wake & proximity)", isOn: $model.autoConnect)
                             .toggleStyle(.switch)
 
-                        Toggle("Show a macOS banner notification when phone clipboard arrives", isOn: $model.clipboardNotifications)
+                        Toggle("Show a macOS banner when a Galaxy clipboard item arrives", isOn: $model.clipboardNotifications)
                             .toggleStyle(.switch)
 
                         Toggle("Open Galaxy Continuity at Login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
                             .toggleStyle(.switch)
 
-                        if let profile = model.profile {
-                            Divider()
-                            HStack {
-                                Text("Preferred Galaxy Device")
-                                    .font(.system(size: 13, weight: .medium))
-                                Spacer()
-                                Picker("", selection: Binding(
-                                    get: { model.selectedTarget },
-                                    set: { model.selectPeerAndConnect($0) }
-                                )) {
-                                    ForEach(profile.peers, id: \.address) { peer in
-                                        Text(peer.name + (peer.model.map { " (\($0))" } ?? "")).tag(peer.address)
-                                    }
-                                }
-                                .frame(maxWidth: 280)
-                            }
+                        Divider()
+                        Text("Clipboard sharing automatically joins nearby devices on your Samsung account. No device selection is needed.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if !model.clipboardPeerNames.isEmpty {
+                            Text("Clipboard connected: " + model.clipboardPeerNames.joined(separator: ", "))
+                                .font(.caption).fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
+
+                UpdatesCard(canInstall: !features.multi.controlling && !features.busy && features.storage.mountURL == nil)
 
                 OneUICard {
                     DisclosureGroup("Advanced & Migration Tools", isExpanded: $showAdvanced) {
@@ -1426,6 +1465,7 @@ struct MenuBarExtraView: View {
     @ObservedObject var model: LabModel
     @ObservedObject var buds: BudsModel
     @ObservedObject var calls: CallingController
+    @ObservedObject var hotspots: HotspotsModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1440,14 +1480,20 @@ struct MenuBarExtraView: View {
             Button("Send Mac Clipboard to Phone") {
                 model.sendClipboard()
             }
-            .disabled(!model.connected && model.lanPeers.isEmpty)
+            .disabled(!model.automaticClipboard || !model.hasClipboardLinks)
 
             Toggle("Auto-Sync Clipboard", isOn: $model.automaticClipboard)
 
-            Button("Connect Using Phone Hotspot") {
-                model.hotspot()
+            Menu("Auto Hotspot") {
+                ForEach(model.nearbyPeers.filter { $0.nearby && $0.deviceType?.lowercased() != "pc" }) { peer in
+                    Button(peer.name) {
+                        if let profile = model.profile {
+                            hotspots.join(profile: profile, peer: peer, existing: model.clipboardSession(for: peer.address))
+                        }
+                    }.disabled(hotspots.busy)
+                }
+                Button("Show Hotspots…") { AppWindowPolicy.shared.show(.hotspots) }
             }
-            .disabled(!model.connected || model.hotspotBusy)
 
             if !buds.selection.isEmpty {
                 Button("Take Galaxy Buds Audio on Mac") {
@@ -1469,10 +1515,7 @@ struct MenuBarExtraView: View {
             }
 
             Button("Show Galaxy Continuity Window") {
-                NSApp.activate(ignoringOtherApps: true)
-                for window in NSApp.windows where window.canBecomeMain {
-                    window.makeKeyAndOrderFront(nil)
-                }
+                AppWindowPolicy.shared.show()
             }
 
             Divider()
@@ -1485,12 +1528,14 @@ struct MenuBarExtraView: View {
 }
 
 @main struct LabApp: App {
+    @NSApplicationDelegateAdaptor(ContinuityAppDelegate.self) private var appDelegate
     @StateObject private var model = LabModel()
     @StateObject private var buds = BudsModel()
     @StateObject private var features = FeaturesModel()
+    @StateObject private var hotspots = HotspotsModel()
 
     init() {
-        try? SMBStorageRecovery.restore()
+        if !AppVersion.isRenderingDemo && !AppVersion.isWindowSelfTest { try? SMBStorageRecovery.restore() }
         let args = CommandLine.arguments
         if let idx = args.firstIndex(of: "--render-screenshots"), idx + 1 < args.count {
             let outputDir = args[idx + 1]
@@ -1500,24 +1545,27 @@ struct MenuBarExtraView: View {
             }
             return
         }
-        Task { @MainActor in CallingPresence.start() }
+        if !AppVersion.isWindowSelfTest { Task { @MainActor in CallingPresence.start() } }
     }
 
     var body: some Scene {
-        WindowGroup(AppVersion.appName) {
-            LabView(model: model, buds: buds, features: features)
+        WindowGroup(AppVersion.appName, id: "main") {
+            LabView(model: model, buds: buds, features: features, hotspots: hotspots)
                 .task {
+                    if AppVersion.isRenderingDemo { return }
+                    if AppVersion.isWindowSelfTest { WindowLifecycleTest.start(); return }
                     model.start()
                     buds.trace = { model.trace($0) }
                     buds.start()
                     features.trace = { model.trace($0) }
                     features.start()
+                    AppUpdates.shared.checkAtLaunchIfEnabled()
                 }
         }
         .defaultSize(width: 960, height: 680)
 
         MenuBarExtra(AppVersion.appName, systemImage: model.connected ? "iphone.radiowaves.left.and.right" : "iphone") {
-            MenuBarExtraView(model: model, buds: buds, calls: CallingController.shared)
+            MenuBarExtraView(model: model, buds: buds, calls: CallingController.shared, hotspots: hotspots)
         }
     }
 }

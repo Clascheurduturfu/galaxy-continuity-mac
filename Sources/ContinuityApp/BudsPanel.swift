@@ -6,7 +6,7 @@ import ContinuityCore
     @Published var devices: [PairedBuds] = []
     @Published var selection: String = UserDefaults.standard.string(forKey: "buds.selectedDevice") ?? "" {
         didSet {
-            if !selection.isEmpty {
+            if !AppVersion.isRenderingDemo, !selection.isEmpty {
                 UserDefaults.standard.set(selection, forKey: "buds.selectedDevice")
             }
         }
@@ -16,10 +16,19 @@ import ContinuityCore
     @Published var connected = false
     @Published var peerStatus = ""
     @Published var automaticSwitching: Bool = UserDefaults.standard.bool(forKey: "buds.automaticSwitching")
+    @Published var pauseOnTakeover = UserDefaults.standard.object(forKey: "buds.pauseOnTakeover") as? Bool ?? true {
+        didSet { if !AppVersion.isRenderingDemo { UserDefaults.standard.set(pauseOnTakeover, forKey: "buds.pauseOnTakeover") }; if started { updatePlaybackObservation() } }
+    }
     private let connection = BudsConnection()
     private var operation: Task<Void, Never>?
-    private var audioMonitor: Task<Void, Never>?
-    private var switchMonitor: Task<Void, Never>?
+    private let playback = BudsPlaybackObserver()
+    private var lastDefaultPlaying = false
+    private var lastBudsPlayingAt = Date.distantPast
+    private var otherDeviceActive = false
+    private var stoppedSinceTakeover = true
+    private var previousAudioState: BudsAudio.State?
+    private var takeoverPauseSent = false
+    private var started = false
     var trace: ((String) -> Void)?
 
     private func note(_ value: String) {
@@ -28,13 +37,22 @@ import ContinuityCore
     }
 
     func start() {
+        guard !started else { return }; started = true
+        selection = PairedBuds.canonicalID(selection)
         connection.status = { [weak self] in self?.note($0) }
-        connection.closed = { [weak self] in self?.connected = false; self?.audioMonitor?.cancel() }
+        connection.closed = { [weak self] in self?.connected = false; self?.updatePlaybackObservation() }
         connection.diagnostic = { [weak self] in self?.trace?("Buds: " + $0) }
         connection.received = { [weak self] packet in
             self?.trace?(String(format: "Buds: Received message 0x%02x, %d bytes.", packet.id, packet.payload.count))
             if let supported = packet.supportsMultipoint { self?.trace?("Buds: Multipoint supported: \(supported).") }
             if let state = packet.multipointStatus {
+                if let self {
+                    if state.background, !self.otherDeviceActive, self.pauseOnTakeover,
+                       ((self.previousAudioState?.selected == true && self.previousAudioState?.playing == true) || Date().timeIntervalSince(self.lastBudsPlayingAt) < 3) {
+                        self.pauseForTakeover()
+                    }
+                    self.otherDeviceActive = state.background
+                }
                 let text = "Buds report: \(state.background ? "background" : "foreground"), stream \(state.stream), reason \(state.reason)."
                 self?.trace?("Buds: " + text)
                 if state.stream & 0x80 != 0 { self?.peerStatus = state.background ? "Another device is requesting audio." : "Mac audio switch in progress." }
@@ -47,18 +65,20 @@ import ContinuityCore
         if CommandLine.arguments.contains("--buds-auto-switch-test") { setAutomaticSwitching(true) }
         else if CommandLine.arguments.contains("--buds-probe") { connect(takeAfter: CommandLine.arguments.contains("--buds-take-audio-test")) }
         else if automaticSwitching, !selection.isEmpty { setAutomaticSwitching(true, persist: false) }
+        updatePlaybackObservation()
     }
 
     func refresh() {
         guard !busy, !connected else { return }
         devices = BudsConnection.pairedDevices()
-        let saved = UserDefaults.standard.string(forKey: "buds.selectedDevice") ?? ""
+        let saved = PairedBuds.canonicalID(UserDefaults.standard.string(forKey: "buds.selectedDevice") ?? "")
         if !saved.isEmpty, devices.contains(where: { $0.id == saved }) {
             selection = saved
         } else if !devices.contains(where: { $0.id == selection }) {
             selection = devices.first?.id ?? ""
         }
         note(devices.isEmpty ? "No paired Galaxy Buds found. Pair them in macOS Bluetooth settings, then refresh." : "Ready for Galaxy Buds audio handoff.")
+        if started { updatePlaybackObservation() }
     }
 
     func connect(takeAfter: Bool = false) {
@@ -108,48 +128,45 @@ import ContinuityCore
         note("The switch request was sent, but no matching Mac audio output appeared. Check the Buds connection in Bluetooth settings.")
     }
 
-    private func monitorAudio() {
-        audioMonitor?.cancel()
-        guard let chosen = devices.first(where: { $0.id == selection }) else { return }
-        audioMonitor = Task {
-            var previous: BudsAudio.State?
-            while !Task.isCancelled, connected {
-                do {
-                    let state = try BudsAudio.state(address: chosen.id, name: chosen.name)
-                    if state != previous {
-                        try connection.send(.output(selected: state.selected))
-                        try connection.send(.playback(playing: state.playing))
-                        trace?("Buds: Mac output selected: \(state.selected); playback running: \(state.playing).")
-                        previous = state
-                    }
-                    try await Task.sleep(nanoseconds: 500_000_000)
-                } catch {
-                    if !Task.isCancelled { trace?("Buds: Audio-state reporting stopped: " + error.localizedDescription) }
-                    break
+    private func monitorAudio() { previousAudioState = nil; updatePlaybackObservation() }
+    private func updatePlaybackObservation() {
+        playback.changed = { [weak self] in self?.audioChanged() }
+        if connected || automaticSwitching || (pauseOnTakeover && !selection.isEmpty) { playback.start() } else { playback.stop() }
+    }
+    private func pauseForTakeover() {
+        guard pauseOnTakeover, !takeoverPauseSent else { return }
+        takeoverPauseSent = true; stoppedSinceTakeover = false; otherDeviceActive = true
+        note(MacMediaPause.request() ? "Requested pause in the Mac's active media player." : "macOS did not accept the media pause command; pause your player manually.")
+    }
+    private func audioChanged() {
+        if previousAudioState?.selected == true && previousAudioState?.playing == true { lastBudsPlayingAt = Date() }
+        let playing = BudsAudio.defaultOutputIsPlaying()
+        if !playing { stoppedSinceTakeover = true }
+        if let chosen = devices.first(where: { $0.id == selection }),
+           let state = try? BudsAudio.state(address: chosen.id, name: chosen.name) {
+            if previousAudioState?.selected == true && previousAudioState?.playing == true && !state.selected { pauseForTakeover() }
+            if state.selected && state.playing { lastBudsPlayingAt = Date(); takeoverPauseSent = false }
+            if state != previousAudioState {
+                if connected {
+                    try? connection.send(.output(selected: state.selected))
+                    try? connection.send(.playback(playing: state.playing))
                 }
+                previousAudioState = state
             }
+        }
+        let beganPlaying = playing && !lastDefaultPlaying
+        lastDefaultPlaying = playing
+        if automaticSwitching, beganPlaying, !busy, !selection.isEmpty,
+           !otherDeviceActive || stoppedSinceTakeover {
+            if connected { takeAudio() } else { connect(takeAfter: true) }
         }
     }
 
     func setAutomaticSwitching(_ enabled: Bool, persist: Bool = true) {
         automaticSwitching = enabled
         if persist { UserDefaults.standard.set(enabled, forKey: "buds.automaticSwitching") }
-        switchMonitor?.cancel()
-        switchMonitor = nil
-        guard enabled else { return }
-        note("Auto Switch active: watching Mac audio playback.")
-        switchMonitor = Task {
-            var wasPlaying = false
-            while !Task.isCancelled, automaticSwitching {
-                let playing = BudsAudio.defaultOutputIsPlaying()
-                if playing && !wasPlaying, !busy, !selection.isEmpty {
-                    trace?("Buds: Mac playback started; requesting audio (control connected: \(connected)).")
-                    if connected { takeAudio() } else { connect(takeAfter: true) }
-                }
-                wasPlaying = playing
-                do { try await Task.sleep(nanoseconds: 300_000_000) } catch { break }
-            }
-        }
+        if enabled { note("Auto Switch active: listening for Mac playback changes.") }
+        updatePlaybackObservation()
     }
 
     func releaseBuds() {
@@ -164,17 +181,14 @@ import ContinuityCore
     func stop(clearAutoSwitch: Bool = false) {
         if clearAutoSwitch {
             setAutomaticSwitching(false, persist: true)
-        } else {
-            switchMonitor?.cancel()
-            switchMonitor = nil
         }
-        audioMonitor?.cancel()
-        audioMonitor = nil
+        playback.stop()
         operation?.cancel()
         operation = nil
         connection.disconnect()
         connected = false
         busy = false
+        if !clearAutoSwitch { updatePlaybackObservation() }
     }
 
     var selectedName: String {
@@ -188,7 +202,7 @@ struct BudsPanel: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                OneUIPageHeader("Galaxy Buds", subtitle: "Seamless MDE V3 audio handoff between your Galaxy phone and Mac") {
+                OneUIPageHeader("Galaxy Buds", subtitle: "Switch audio between your Galaxy devices and Mac") {
                     OneUIStatusPill(
                         model.connected ? "Connected" : (model.automaticSwitching ? "Auto Switch On" : "Standby"),
                         tone: model.connected ? .connected : (model.automaticSwitching ? .active : .neutral)
@@ -231,6 +245,7 @@ struct BudsPanel: View {
                             .disabled(model.busy || model.connected)
 
                             Button("Refresh") { model.refresh() }
+                                .help("Reload the Galaxy Buds already paired in macOS Bluetooth settings.")
                                 .buttonStyle(OneUISecondaryButtonStyle())
                                 .disabled(model.busy || model.connected)
 
@@ -240,26 +255,19 @@ struct BudsPanel: View {
                                 }
                             }
                             .buttonStyle(OneUISecondaryButtonStyle())
+                            .help("Open macOS Bluetooth settings to pair Buds, reconnect them, or remove an old pairing.")
                         }
 
                         HStack(spacing: 10) {
-                            Button(model.busy ? "Working…" : (model.connected ? "Take Audio on Mac" : "Connect & Take Audio")) {
+                            Button(model.busy ? "Working…" : "Take Audio on Mac") {
                                 model.takeAudio()
                             }
                             .buttonStyle(OneUIPrimaryButtonStyle())
                             .disabled(model.selection.isEmpty || model.busy)
-
-                            if !model.connected {
-                                Button("Open Control Channel") { model.connect() }
-                                    .buttonStyle(OneUISecondaryButtonStyle())
-                                    .disabled(model.selection.isEmpty || model.busy)
-                            } else {
-                                Button("Close Control") { model.stop() }
-                                    .buttonStyle(OneUISecondaryButtonStyle())
-                                    .disabled(model.busy)
-                            }
+                            .help("Connect the selected Buds if needed, ask them to switch to this Mac, then select them as the Mac audio output.")
 
                             Button("Disconnect Buds") { model.releaseBuds() }
+                                .help("Disconnect the Buds from this Mac without forgetting their pairing or changing the phone's connection. Auto Switch can reconnect on later Mac playback.")
                                 .buttonStyle(OneUISecondaryButtonStyle())
                                 .disabled(model.selection.isEmpty || model.busy)
                         }
@@ -275,6 +283,7 @@ struct BudsPanel: View {
                                 Text("Automatically connects and pulls audio to this Mac when media starts playing, even if the Buds are currently connected only to your phone.")
                                     .font(.system(size: 12))
                                     .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             Spacer()
                             Toggle("", isOn: Binding(get: { model.automaticSwitching }, set: { model.setAutomaticSwitching($0) }))
@@ -282,6 +291,11 @@ struct BudsPanel: View {
                                 .labelsHidden()
                                 .disabled(model.selection.isEmpty)
                         }
+                        Divider()
+                        Toggle("Pause Mac playback when another device takes the Buds", isOn: $model.pauseOnTakeover)
+                            .toggleStyle(.switch)
+                        Text("Also pauses if the Mac loses the Buds audio route. Uses the active player's system pause command; support depends on the player and macOS. Never resumes playback automatically.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         Divider()
                         Label("Pair your Buds with this Mac once. If first pairing disconnected your phone, reconnect them once in the phone's Bluetooth settings so both links coexist.", systemImage: "info.circle")
                             .font(.system(size: 12))

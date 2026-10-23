@@ -1,0 +1,16 @@
+# v1.0 Beta 3 (52)
+
+- Clipboard Sync automatically joins nearby account phones/tablets through separate authenticated sessions, plus existing Galaxy Book LAN links. Removed the target picker, Home switch menu and per-device Clipboard buttons. A single master switch blocks new outgoing and incoming clipboard items and cancels pending image transfers. A network packet already submitted before switching off cannot be recalled. Connected command links remain available to Multi Control and hotspot when clipboard sharing is off.
+- Extra device connections are discovery-driven, deduplicated by Bluetooth identity, and retried with capped backoff only while the peer is advertised. Clipboard content is neither logged nor uploaded. Feature actions reuse the matching authenticated peer session.
+- Removed the normal Buds control-channel buttons. Take Audio handles connection and switching; Disconnect keeps pairing. Refresh, Bluetooth Settings and both audio actions have hover explanations.
+- GitHub update checks try without authentication first. After the repository becomes public and anonymous access succeeds, the app deletes the updater token and hides the temporary access section. Saved private tokens are checked once on launch as well as manually; no periodic polling. Deleting the local token does not revoke the GitHub token.
+- Added Create Read Token to open GitHub's official prefilled fine-grained token form. The owner must choose only this repository and generate/save the token. No broad GitHub CLI token is copied into the app.
+- This preview includes the earlier Beta 2 UI, arrangement, Contacts, per-device hotspot and window lifecycle changes.
+
+## Validation
+
+Native arm64 regression build passed all 110 tests with zero failures; the final UI-only release build also passed. Window close/reopen smoke tests passed all five checks, and six synthetic demo images were regenerated and visibly labeled. Independent source review resolved the update redirect-origin finding and found no remaining confidentiality blocker in the reviewed source.
+
+The Mac went offline during delivery. The installation attempt tripped a credential preservation assertion and its transaction restored/reopened the previous Beta 2 app. The snapshot had been taken while the old app was still running; a credential change before/during shutdown could trigger it. The new local installer snapshots credentials only after the app stops and checks a stable baseline before replacement. This installer has been syntax/static reviewed, but its live retry is pending. Current installed version/process state must be verified when the Mac returns.
+
+A final Beta 3 app/source release archive has not been retrieved or published. Temporary Mac build files remain in the owned staging directory pending retrieval and cleanup; no background build or render was still running at the last completed checks. No continuous SSH polling is running. Preview source publication is separate from a downloadable app release. Prior Beta 2 edge switching was accepted by the owner. Simultaneous live phone/tablet text and image exchange needs a fresh copy test with both devices discoverable; unit tests are not a substitute.

@@ -30,6 +30,10 @@ public enum MultiControlWire {
     private var phoneID = ""
     private var jsonBuffer = Data()
     private var phoneSize = (1080, 2400)
+    private var phoneDisplay: [String: Any] = [:]
+    private var placement = DevicePlacement()
+    private var hostSize = (1440, 900)
+    private var lastLayoutSignature = ""
     private var sequence = 0
     private var ownInformation: [String: Any]?
     private var informationResends = 0
@@ -44,6 +48,7 @@ public enum MultiControlWire {
     public var status: ((String) -> Void)?
     public var changed: (() -> Void)?
     public var released: (() -> Void)?
+    public var focusReturned: (() -> Void)?
     public init() {
         session.status = { [weak self] in self?.status?($0) }
         session.received = { [weak self] data in
@@ -54,7 +59,7 @@ public enum MultiControlWire {
         }
     }
     public func connect(profile: ContinuityProfile, width: Int, height: Int, host: String? = nil, port: UInt16? = nil, sharing command: ClipboardSession? = nil) async throws {
-        await disconnect(); ownID = MultiControlWire.deviceID(address: profile.localBluetoothAddress); phoneID = ""; jsonBuffer = Data()
+        await disconnect(); ownID = MultiControlWire.deviceID(address: profile.localBluetoothAddress); phoneID = ""; jsonBuffer = Data(); hostSize = (width, height); lastLayoutSignature = ""
         if let command { try await session.connect(profile: profile, sharing: command) }
         else if let host, let port { try await session.connect(profile: profile, host: host, port: port) }
         else { try await session.connect(profile: profile) }
@@ -95,8 +100,10 @@ public enum MultiControlWire {
                 if let devices = parameters["DEVICE_LIST"] as? [[String: Any]],
                    let phone = devices.first(where: { ($0["DEVICE_TYPE"] as? Int) == 1 }) ?? devices.first(where: { ($0["DEVICE_ID"] as? String) != ownID }), let id = phone["DEVICE_ID"] as? String {
                     phoneID = id
+                    phoneDisplay = phone
                     phoneSize = (max(1, (phone["RIGHT"] as? Int ?? 1080) - (phone["LEFT"] as? Int ?? 0)), max(1, (phone["BOTTOM"] as? Int ?? 2400) - (phone["TOP"] as? Int ?? 0)))
                     status?("Phone display received. Choose Control phone to send keyboard and mouse input."); changed?()
+                    try await publishLayout()
                 }
                 // The tablet's service can start after our first DEVICE_INFORMATION and then
                 // keeps asking for our layout; answer its repeats a few times (bounded).
@@ -110,16 +117,32 @@ public enum MultiControlWire {
                     // Test hook (`--multi-regain-focus`): a synthetic stream drifts to the display edge, where the
                     // device hands focus back; take it again and keep measuring.
                     if controlling, CommandLine.arguments.contains("--multi-regain-focus") { focusRegains += 1; status?("Focus returned by the device; taking it again (\(focusRegains))."); try await takeControl() }
-                    else { await release(notifyPhone: false) }
+                    else { focusReturned?(); await release(notifyPhone: false) }
                 }
             case "REQUEST_DISCONNECTION": await disconnect(); status?("The phone ended Multi Control.")
             default: break
             }
     }
-    public func takeControl() async throws {
+    public func configurePlacement(_ value: DevicePlacement) async throws {
+        placement = value
+        if isReadyForControl { try await publishLayout() }
+    }
+    private func publishLayout() async throws {
+        guard !phoneID.isEmpty, let own = ownInformation?["DEVICE_LIST"] as? [[String: Any]] else { return }
+        let origin = placement.remoteOrigin(hostWidth: hostSize.0, hostHeight: hostSize.1, remoteWidth: phoneSize.0, remoteHeight: phoneSize.1)
+        let signature = "\(phoneID):\(hostSize):\(phoneSize):\(origin)"
+        guard signature != lastLayoutSignature else { return }
+        var remote = phoneDisplay
+        remote["LEFT"] = origin.x; remote["TOP"] = origin.y
+        remote["RIGHT"] = origin.x + phoneSize.0; remote["BOTTOM"] = origin.y + phoneSize.1
+        try await send("DEVICE_LAYOUT_CHANGED", ["DEVICE_LIST": own + [remote]])
+        lastLayoutSignature = signature
+    }
+    public func takeControl(entryFraction: Double? = nil) async throws {
         guard connected, !phoneID.isEmpty else { throw ContinuityError.message("Wait for the phone's display information first.") }
         sequence += 1
-        try await send("FOCUS_DEVICE_CHANGED", ["TARGET": phoneID, "X": phoneSize.0 / 2, "Y": phoneSize.1 / 2, "SEQ": sequence])
+        let entry = entryFraction.map { placement.remoteEntry(width: phoneSize.0, height: phoneSize.1, fraction: $0) }
+        try await send("FOCUS_DEVICE_CHANGED", ["TARGET": phoneID, "X": entry?.x ?? phoneSize.0 / 2, "Y": entry?.y ?? phoneSize.1 / 2, "SEQ": sequence])
         controlling = true; changed?()
     }
     /// True once the phone's display information arrived and control can be taken.

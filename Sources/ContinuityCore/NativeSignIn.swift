@@ -307,6 +307,8 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
     public func signOut() throws { web?.cancel(); web = nil; try NativeAuthStore.delete(); try CredentialFiles.delete("samsung-calls.json") }
     public nonisolated func hasStoredSignIn() throws -> Bool { try NativeAuthStore.loadIfPresent() != nil }
+    /// Account label for local UI only. Credentials and tokens never leave the store.
+    public nonisolated func signedInAccountLabel() throws -> String? { try NativeAuthStore.loadIfPresent()?.loginID }
     /// Read-only CMC eligibility probe. Does not enroll a calling device or place a call.
     public func checkCallingAccount(status: (String) -> Void) async throws -> String {
         let context = try await callingContext(status: status)

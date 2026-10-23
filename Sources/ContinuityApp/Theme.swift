@@ -3,10 +3,12 @@ import AppKit
 
 public enum AppVersion {
     public static let appName = "Galaxy Continuity"
-    public static let short = "1.0-beta.1"
-    public static let display = "v1.0 Beta 1"
-    public static let build = "50"
-    public static let full = "v1.0 Beta 1 (50)"
+    public static let short = "1.0-beta.3"
+    public static let display = "v1.0 Beta 3"
+    public static let build = "52"
+    public static let full = "v1.0 Beta 3 (52)"
+    public static var isRenderingDemo: Bool { CommandLine.arguments.contains("--render-screenshots") }
+    public static var isWindowSelfTest: Bool { CommandLine.arguments.contains("--window-lifecycle-selftest") }
 }
 
 public enum OneUI {
@@ -132,16 +134,19 @@ public struct OneUIPageHeader<Trailing: View>: View {
     }
 
     public var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.system(size: 26, weight: .bold, design: .rounded))
-                Text(subtitle)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                heading.fixedSize(horizontal: true, vertical: false)
+                Spacer(minLength: 0)
+                trailing
             }
-            Spacer()
-            trailing
+            VStack(alignment: .leading, spacing: 12) { heading; trailing }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 26, weight: .bold, design: .rounded))
+            Text(subtitle).font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 }

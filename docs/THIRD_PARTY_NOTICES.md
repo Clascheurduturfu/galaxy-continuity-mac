@@ -6,4 +6,6 @@ Continuity cloud registration, certificate enrollment, peer discovery, clipboard
 
 Native calling groundwork statically links Cisco libSRTP 2.6.0 (BSD-style license), OpenCORE AMR 0.1.6 and VisualOn AMR-WB encoder 0.1.3 (Apache License 2.0). Complete upstream licenses are in `third-party/calling-*-LICENSE.txt` and the Mac app's Resources/Notices directory. `scripts/bootstrap-calling.py` records the upstream archive URLs and SHA-256 checksums and builds these in an isolated `.build` directory. No Samsung codec DLL is included.
 
-The project uses Apple's system frameworks and has no bundled third-party Swift runtime dependencies. Source licensing for the owner's original code remains to be selected by the owner.
+The project uses Apple's system frameworks and has no bundled third-party Swift runtime dependencies. The authored client source is licensed under the repository's MIT LICENSE.
+
+Hotspot system-menu feasibility was informed by the MIT-licensed [Tetherbug](https://github.com/xav-ie/Tetherbug) project (Xavier Ruiz). No Tetherbug code, Android app or Shizuku component is bundled. Its Apple Wi-Fi beacon-marker technique is separate from Samsung account hotspot activation and cannot provide Apple's BLE/Apple Account device section.

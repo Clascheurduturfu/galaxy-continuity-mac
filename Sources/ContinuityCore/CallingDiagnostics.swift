@@ -11,7 +11,8 @@ final class CallingDiagnostics: @unchecked Sendable {
     private let formatter: DateFormatter
 
     init(directory: URL? = nil, name: String = "call-diagnostics.log") {
-        let base = directory ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Galaxy Continuity Lab", isDirectory: true)
+        let testDirectory = ProcessInfo.processInfo.environment["CONTINUITY_CALL_DIAGNOSTICS_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let base = directory ?? testDirectory ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Galaxy Continuity Lab", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         url = base.appendingPathComponent(name)
         formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss.SSS"

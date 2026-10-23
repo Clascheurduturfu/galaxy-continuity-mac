@@ -209,40 +209,33 @@ struct CallsPanel: View {
                     }
                     .frame(maxWidth: 340)
 
-                    OneUICard {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Text("Connection & Account Diagnostics")
-                                .font(.system(size: 15, weight: .semibold))
-                            Text("Calling uses your Samsung account and IMS/SIP over TLS with encrypted AMR-WB/SRTP audio. Your phone does not need to be paired over Bluetooth or on the same Wi-Fi network.")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
-
-                            HStack(spacing: 10) {
-                                Button(model.checkingSamsung ? "Checking…" : "Verify Calling Account") {
-                                    model.checkSamsung()
-                                }
-                                .buttonStyle(OneUISecondaryButtonStyle())
-                                .disabled(model.checkingSamsung)
-
-                                Button("Verify SIP Server Reachability") {
-                                    model.checkSamsung(transport: true)
-                                }
-                                .buttonStyle(OneUISecondaryButtonStyle())
-                                .disabled(model.checkingSamsung)
-                            }
-
-                            Divider()
-
-                            Text(model.samsungStatus)
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
+                    VStack(alignment: .leading, spacing: 18) {
+                        ContactsPicker(number: $model.callNumber)
+                        CallDiagnosticsCard(model: model)
                     }
                 }
             }
             .padding(28)
         }
         .task { model.start() }
+    }
+}
+
+private struct CallDiagnosticsCard: View {
+    @ObservedObject var model: CallsModel
+    var body: some View {
+        OneUICard {
+            DisclosureGroup("Connection diagnostics") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("The Mac and phone can use different Internet connections. Samsung Call & text on other devices must be enabled on the phone.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button(model.checkingSamsung ? "Checking…" : "Check Calling Account") { model.checkSamsung() }
+                        .buttonStyle(OneUISecondaryButtonStyle()).disabled(model.checkingSamsung)
+                    Button("Check Calling Server") { model.checkSamsung(transport: true) }
+                        .buttonStyle(OneUISecondaryButtonStyle()).disabled(model.checkingSamsung)
+                    Text(model.samsungStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }.padding(.top, 12)
+            }
+        }
     }
 }

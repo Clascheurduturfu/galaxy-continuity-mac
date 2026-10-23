@@ -32,11 +32,18 @@ enum KeyboardClipArchive {
         for (name, data) in entries {
             let nameBytes = Data(name.utf8)
             let crc = data.withUnsafeBytes { UInt32(crc32(0, $0.bindMemory(to: Bytef.self).baseAddress, uInt(data.count))) }
-            let common = le16(20) + le16(0) + le16(0) + le16(0) + le16(0x21) + le32(crc) + le32(UInt32(data.count)) + le32(UInt32(data.count)) + le16(nameBytes.count) + le16(0)
-            directory += le32(0x02014b50) + le16(20) + common + le16(0) + le16(0) + le16(0) + le32(0) + le32(UInt32(body.count)) + nameBytes
-            body += le32(0x04034b50) + common + nameBytes + data
+            let commonFields: [Data] = [le16(20), le16(0), le16(0), le16(0), le16(0x21), le32(crc), le32(UInt32(data.count)), le32(UInt32(data.count)), le16(nameBytes.count), le16(0)]
+            var common = Data()
+            for field in commonFields { common.append(field) }
+            let directoryFields: [Data] = [le32(0x02014b50), le16(20), common, le16(0), le16(0), le16(0), le32(0), le32(UInt32(body.count)), nameBytes]
+            for field in directoryFields { directory.append(field) }
+            body.append(le32(0x04034b50)); body.append(common)
+            body.append(nameBytes); body.append(data)
         }
-        return body + directory + le32(0x06054b50) + le16(0) + le16(0) + le16(entries.count) + le16(entries.count)
-            + le32(UInt32(directory.count)) + le32(UInt32(body.count)) + le16(0)
+        let footer: [Data] = [le32(0x06054b50), le16(0), le16(0), le16(entries.count), le16(entries.count), le32(UInt32(directory.count)), le32(UInt32(body.count)), le16(0)]
+        var archive = body
+        archive.append(directory)
+        for field in footer { archive.append(field) }
+        return archive
     }
 }

@@ -8,18 +8,15 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
-      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Bootstrap calling C libraries (libsrtp, opencore-amr, vo-amrwbenc)
-        run: python3 scripts/bootstrap-calling.py
+      - name: Show selected toolchain
+        run: swift --version
 
-      - name: Run Swift test suite
-        run: swift test
-
-      - name: Build release macOS app bundle and CLI
+      - name: Build and test macOS app bundle and CLI
         run: bash scripts/build-macos.sh

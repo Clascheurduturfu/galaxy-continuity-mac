@@ -5,8 +5,8 @@ public enum AppVersion {
     public static let appName = "Galaxy Continuity"
     public static let short = "1.0-beta.3"
     public static let display = "v1.0 Beta 3"
-    public static let build = "52"
-    public static let full = "v1.0 Beta 3 (52)"
+    public static let build = "53"
+    public static let full = "v1.0 Beta 3 (53)"
     public static var isRenderingDemo: Bool { CommandLine.arguments.contains("--render-screenshots") }
     public static var isWindowSelfTest: Bool { CommandLine.arguments.contains("--window-lifecycle-selftest") }
 }

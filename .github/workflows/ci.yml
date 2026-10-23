@@ -1,0 +1,23 @@
+name: macOS Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bootstrap calling C libraries (libsrtp, opencore-amr, vo-amrwbenc)
+        run: python3 scripts/bootstrap-calling.py
+
+      - name: Run Swift test suite
+        run: swift test
+
+      - name: Build release macOS app bundle and CLI
+        run: bash scripts/build-macos.sh

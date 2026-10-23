@@ -1,0 +1,7 @@
+work/
+.private/
+.build/
+dist/
+.DS_Store
+__pycache__/
+*.samsungcontinuity

@@ -11,7 +11,7 @@ import ContinuityCore
         RunLoop.main.add(keepAlive, forMode: .common)
         let command = args.dropFirst().first ?? "help"
         do {
-            if command == "version" { print("Galaxy Continuity v1.0 (55)"); return }
+            if command == "version" { print("Galaxy Continuity v1.0"); return }
             if ["cmc-check", "cmc-transport", "cmc-register-test"].contains(command) {
                 Task {
                     do {

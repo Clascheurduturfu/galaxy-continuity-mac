@@ -741,7 +741,7 @@ struct LabView: View {
 
                 List(SidebarSection.allCases, selection: $selectedSection) { section in
                     Label { Text(section.rawValue) } icon: {
-                        Image(systemName: section.symbol).foregroundStyle(selectedSection == section ? Color.white : Color.secondary)
+                        Image(systemName: section.symbol).foregroundStyle(selectedSection == section ? (scheme == .dark ? Color.white : OneUI.blue) : Color.secondary)
                     }
                         .font(.system(size: 13, weight: .medium))
                         .tag(section)
@@ -1076,10 +1076,11 @@ private struct HeroDeviceCard: View {
                             .buttonStyle(OneUIPrimaryButtonStyle())
                             .disabled(model.signingIn)
                         } else if model.connected || model.busy {
-                            Button("Pause") {
+                            Button("Pause Device Connections") {
                                 model.pauseConnection()
                             }
                             .buttonStyle(OneUISecondaryButtonStyle())
+                            .help("Disconnect nearby phones and tablets and pause their automatic reconnection. Clipboard Sync remains enabled for Galaxy PC network links; use its switch to stop all clipboard sharing.")
                         } else if model.userPaused {
                             Button("Resume Connection") {
                                 model.resumeConnection()
@@ -1272,7 +1273,7 @@ struct ClipboardPageView: View {
                 OneUICard {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack {
-                            Text("Latest Clipboard Item")
+                            Text("Last Received Clipboard Item")
                                 .font(.system(size: 15, weight: .semibold))
                             Spacer()
                             Button("Send Current Mac Clipboard") {
@@ -1280,6 +1281,7 @@ struct ClipboardPageView: View {
                             }
                             .buttonStyle(OneUIPrimaryButtonStyle())
                             .disabled(!model.automaticClipboard || !model.hasClipboardLinks)
+                            .help("Send the current Mac clipboard to connected devices. The preview shows the last item received, which may be different. Clipboard Sync and a device connection are required.")
                         }
 
                         if let image = model.receivedImage {
@@ -1289,7 +1291,7 @@ struct ClipboardPageView: View {
                                 .frame(maxHeight: 280)
                                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                         } else {
-                            Text(model.receivedText.isEmpty ? "No phone text received in this session yet." : model.receivedText)
+                            Text(model.receivedText.isEmpty ? "No clipboard item received in this session yet." : model.receivedText)
                                 .font(.system(size: 13))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
@@ -1383,13 +1385,13 @@ struct SettingsPageView: View {
                             .font(.system(size: 16, weight: .bold, design: .rounded))
 
                         Toggle("Connect nearby Galaxy devices automatically (launch, wake & proximity)", isOn: $model.autoConnect)
-                            .toggleStyle(.switch)
+                            .toggleStyle(OneUIAlignedSwitchStyle())
 
                         Toggle("Show a macOS banner when a Galaxy clipboard item arrives", isOn: $model.clipboardNotifications)
-                            .toggleStyle(.switch)
+                            .toggleStyle(OneUIAlignedSwitchStyle())
 
                         Toggle("Open Galaxy Continuity at Login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
-                            .toggleStyle(.switch)
+                            .toggleStyle(OneUIAlignedSwitchStyle())
 
                         Divider()
                         Text("Clipboard sharing automatically joins nearby devices on your Samsung account. No device selection is needed.")

@@ -3,7 +3,8 @@ import AppKit
 // Apply after --render-screenshots: bitmap stamping stays visible even when an offscreen SwiftUI overlay has not drawn yet.
 let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 let label = "Demo · fictional account and device state" as NSString
-for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) where file.pathExtension == "png" {
+let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)!
+for case let file as URL in files where file.pathExtension == "png" {
     guard let bitmap = NSBitmapImageRep(data: try Data(contentsOf: file)), let context = NSGraphicsContext(bitmapImageRep: bitmap) else { continue }
     let scale = CGFloat(bitmap.pixelsWide) / 1040
     let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11 * scale, weight: .semibold), .foregroundColor: NSColor.white]

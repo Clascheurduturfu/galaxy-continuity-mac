@@ -19,6 +19,12 @@ import ContinuityCore
     @Published var pauseOnTakeover = UserDefaults.standard.object(forKey: "buds.pauseOnTakeover") as? Bool ?? true {
         didSet { if !AppVersion.isRenderingDemo { UserDefaults.standard.set(pauseOnTakeover, forKey: "buds.pauseOnTakeover") }; if started { updatePlaybackObservation() } }
     }
+    @Published var excludeSystemSounds = UserDefaults.standard.object(forKey: "buds.excludeSystemSounds") as? Bool ?? BudsPlaybackObserver.processFilteringAvailable {
+        didSet {
+            if !AppVersion.isRenderingDemo { UserDefaults.standard.set(excludeSystemSounds, forKey: "buds.excludeSystemSounds") }
+            if started { updatePlaybackObservation() }
+        }
+    }
     private let connection = BudsConnection()
     private var operation: Task<Void, Never>?
     private let playback = BudsPlaybackObserver()
@@ -131,6 +137,7 @@ import ContinuityCore
     private func monitorAudio() { previousAudioState = nil; updatePlaybackObservation() }
     private func updatePlaybackObservation() {
         playback.changed = { [weak self] in self?.audioChanged() }
+        playback.trackProcesses = excludeSystemSounds && BudsPlaybackObserver.processFilteringAvailable && automaticSwitching
         if connected || automaticSwitching || (pauseOnTakeover && !selection.isEmpty) { playback.start() } else { playback.stop() }
     }
     private func pauseForTakeover() {
@@ -140,7 +147,7 @@ import ContinuityCore
     }
     private func audioChanged() {
         if previousAudioState?.selected == true && previousAudioState?.playing == true { lastBudsPlayingAt = Date() }
-        let playing = BudsAudio.defaultOutputIsPlaying()
+        let playing = excludeSystemSounds && BudsPlaybackObserver.processFilteringAvailable && automaticSwitching ? playback.appPlaybackActive : BudsAudio.defaultOutputIsPlaying()
         if !playing { stoppedSinceTakeover = true }
         if let chosen = devices.first(where: { $0.id == selection }),
            let state = try? BudsAudio.state(address: chosen.id, name: chosen.name) {
@@ -292,8 +299,14 @@ struct BudsPanel: View {
                                 .disabled(model.selection.isEmpty)
                         }
                         Divider()
+                        Toggle("Exclude macOS system sounds", isOn: $model.excludeSystemSounds)
+                            .toggleStyle(OneUIAlignedSwitchStyle()).disabled(!BudsPlaybackObserver.processFilteringAvailable)
+                            .help("Ignore macOS system-sound services when deciding to switch. Sounds still play. Notifications within a browser or another app may still trigger switching.")
+                        Text(BudsPlaybackObserver.processFilteringAvailable ? "Alerts and UI sounds won't take the Buds. App-generated notifications may still count as playback." : "Requires macOS 14.2 or later. Use Take Audio for manual switching.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Divider()
                         Toggle("Pause Mac playback when another device takes the Buds", isOn: $model.pauseOnTakeover)
-                            .toggleStyle(.switch)
+                            .toggleStyle(OneUIAlignedSwitchStyle())
                         Text("Also pauses if the Mac loses the Buds audio route. Uses the active player's system pause command; support depends on the player and macOS. Never resumes playback automatically.")
                             .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         Divider()

@@ -57,17 +57,29 @@ enum ScreenshotRenderer {
 
         features.status = "Connected to Galaxy S26 Ultra over Wi-Fi. Storage Share and Multi Control are ready."
         features.multiConnected = true
+        features.multiPeerAddress = peers[0].address
 
         let sections: [(SidebarSection, String)] = [
             (.home, "home-dashboard.png"),
+            (.clipboard, "clipboard.png"),
             (.calls, "phone-calls.png"),
             (.buds, "galaxy-buds.png"),
             (.nearby, "nearby-devices.png"),
             (.multiControl, "multi-control.png"),
-            (.hotspots, "auto-hotspot.png")
+            (.hotspots, "auto-hotspot.png"),
+            (.settings, "settings.png")
         ]
 
-        for (section, filename) in sections {
+        let variants: [(String, ColorScheme, CGFloat, CGFloat, Set<SidebarSection>)] = [
+            ("", .dark, 1040, 700, Set(SidebarSection.allCases)),
+            ("light", .light, 1040, 700, [.home, .buds, .multiControl, .settings]),
+            ("narrow", .dark, 900, 700, [.calls, .nearby, .multiControl, .settings]),
+            ("full", .dark, 1040, 1500, [.buds, .settings])
+        ]
+        for (variant, scheme, width, height, included) in variants {
+        let target = variant.isEmpty ? dirURL : dirURL.appendingPathComponent(variant, isDirectory: true)
+        try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        for (section, filename) in sections where included.contains(section) {
             let rootView = LabView(
                 model: model,
                 buds: buds,
@@ -76,21 +88,22 @@ enum ScreenshotRenderer {
                 selectedSection: section
             )
             .overlay(alignment: .bottomTrailing) { Text("Demo · fictional account and device state").font(.caption).padding(8).background(.ultraThinMaterial).padding(10) }
-            .environment(\.colorScheme, .dark)
-            .frame(width: 1040, height: 700)
+            .environment(\.colorScheme, scheme)
+            .frame(width: width, height: height)
 
-            renderView(rootView, size: NSSize(width: 1040, height: 700), to: dirURL.appendingPathComponent(filename))
+            renderView(rootView, size: NSSize(width: width, height: height), scheme: scheme, to: target.appendingPathComponent(filename))
+        }
         }
     }
 
-    private static func renderView<V: View>(_ view: V, size: NSSize, to url: URL) {
+    private static func renderView<V: View>(_ view: V, size: NSSize, scheme: ColorScheme, to url: URL) {
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.appearance = NSAppearance(named: .darkAqua)
+        window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
         window.title = AppVersion.appName
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(origin: .zero, size: size)

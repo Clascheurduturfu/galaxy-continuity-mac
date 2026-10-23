@@ -24,12 +24,12 @@ private final class UpdateNetworkDelegate: NSObject, URLSessionDownloadDelegate,
     @Published var automaticallyCheck = UserDefaults.standard.bool(forKey: "updates.autoCheck") {
         didSet { UserDefaults.standard.set(automaticallyCheck, forKey: "updates.autoCheck") }
     }
-    @Published var status = "Check GitHub for a newer release. No background polling."
+    @Published var status = "Not checked yet."
     @Published var busy = false
     @Published var release: GitHubRelease?
     @Published var publicRepository: Bool?
     @Published var token = ""
-    @Published var tokenSaved = (try? GitHubUpdateCredentials.load()) != nil
+    @Published var tokenSaved = !AppVersion.isRenderingDemo && (try? GitHubUpdateCredentials.load()) != nil
     private var launchChecked = false
     private let delegate = UpdateNetworkDelegate()
     private lazy var session: URLSession = {
@@ -205,7 +205,7 @@ struct UpdatesCard: View {
                     Button("Releases") { NSWorkspace.shared.open(updates.browserURL) }.buttonStyle(OneUISecondaryButtonStyle()).help("Open published release downloads and release notes on GitHub.")
                     if updates.busy { ProgressView().controlSize(.small) }
                 }
-                Toggle("Check at launch, at most once a day", isOn: $updates.automaticallyCheck).toggleStyle(.switch)
+                Toggle("Check at launch, at most once a day", isOn: $updates.automaticallyCheck).toggleStyle(OneUIAlignedSwitchStyle())
                 if updates.publicRepository != true {
                 DisclosureGroup("Temporary private repository access") {
                     VStack(alignment: .leading, spacing: 9) {

@@ -3,10 +3,10 @@ import AppKit
 
 public enum AppVersion {
     public static let appName = "Galaxy Continuity"
-    public static let short = "1.0-beta.3"
-    public static let display = "v1.0 Beta 3"
-    public static let build = "53"
-    public static let full = "v1.0 Beta 3 (53)"
+    public static let short = "1.0-rc.1"
+    public static let display = "v1.0 RC 1"
+    public static let build = "54"
+    public static let full = "v1.0 RC 1 (54)"
     public static var isRenderingDemo: Bool { CommandLine.arguments.contains("--render-screenshots") }
     public static var isWindowSelfTest: Bool { CommandLine.arguments.contains("--window-lifecycle-selftest") }
 }
@@ -217,39 +217,53 @@ public struct OneUIQuickTile: View {
 }
 
 public struct OneUIPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
     public var tint: Color = OneUI.blue
     public init(tint: Color = OneUI.blue) { self.tint = tint }
 
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(isEnabled ? Color.white : Color.secondary)
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(
                 Capsule(style: .continuous)
-                    .fill(tint.opacity(configuration.isPressed ? 0.82 : 1.0))
+                    .fill(isEnabled ? tint.opacity(configuration.isPressed ? 0.82 : 1.0) : Color.secondary.opacity(0.12))
             )
     }
 }
 
 public struct OneUISecondaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
     @Environment(\.colorScheme) private var scheme
     public init() {}
 
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.primary)
+            .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .background(
                 Capsule(style: .continuous)
-                    .fill(OneUI.elevatedBackground(scheme).opacity(configuration.isPressed ? 0.7 : 1.0))
+                    .fill(OneUI.elevatedBackground(scheme).opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1.0) : 0.45))
                     .overlay(
                         Capsule(style: .continuous)
                             .strokeBorder(OneUI.cardBorder(scheme), lineWidth: 1)
                     )
             )
+    }
+}
+
+/// A consistent trailing switch, independent of macOS' intrinsic Toggle label layout.
+struct OneUIAlignedSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 16) {
+            configuration.label.fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 16)
+            Toggle("", isOn: Binding(get: { configuration.isOn }, set: { configuration.isOn = $0 }))
+                .toggleStyle(.switch).labelsHidden().fixedSize()
+        }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }

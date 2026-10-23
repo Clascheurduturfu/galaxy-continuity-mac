@@ -2,7 +2,7 @@
 
 # Galaxy Continuity — Engineering Roadmap & Checklist
 
-Current release: **v1.0 Beta 1 (build 50)**.
+Current preview: **v1.0 RC 1 (build 54)**.
 
 Completed verification boundaries are documented in [docs/research/validation.md](docs/research/validation.md), and the architecture and protocol reference index is in [docs/README.md](docs/README.md). Unchecked items below represent open hardening, multi-device edge cases, or unverified protocol surfaces.
 
@@ -92,7 +92,7 @@ Completed verification boundaries are documented in [docs/research/validation.md
 
 - [x] Implement MCF SDK AppId `1` session setup, newline JSON control plane, display layout exchange, and binary `M`/`W`/`C`/`K` input framing over UDP and TCP.
 - [x] Move `CGEvent` capture, 6 ms event-driven pacing, AES-CBC encryption, and UDP `sendto` onto a dedicated `.userInteractive` worker thread (`PointerPipeline.swift` / `PointerSender.swift`) with bounded latency telemetry and `(-100, -100)` reserved-vector splitting.
-- [ ] Implement automatic screen-edge cursor handoff (crossing the Mac display boundary to enter/leave the phone or tablet without clicking "Control Phone").
+- [x] Implement automatic screen-edge cursor handoff (crossing the Mac display boundary to enter/leave the phone or tablet without clicking "Control Phone").
 - [ ] Negotiate Mac-to-Android keyboard layout mapping so non-US keyboard layouts produce matching characters without manual phone layout switching.
 - [ ] Compare same-mouse hardware latency and receiver `InputOptimizeHelper` behavior between Galaxy Book and Mac to close the remaining perceived smoothness gap.
 - [ ] Investigate cross-device drag-and-drop and file transfer over Multi Control.
@@ -117,4 +117,8 @@ Completed verification boundaries are documented in [docs/research/validation.md
 
 Automatic nearby account clipboard peers replace manual phone/tablet selection; Clipboard Sync gates both directions while retaining command links for independent features. Buds controls simplified with hover explanations. Private updater token is cleared and its UI hidden after successful public anonymous access. Preview commits, pushes and preview releases are owner-authorized; main/public visibility remain separate. See docs/BETA_3.md for validation and remaining live acceptance.
 
-- [ ] Ignore macOS system/UI sounds when deciding whether Buds auto-switch should take audio. Investigate Core Audio process activity without capturing audio; browser media versus notifications from the same process remains a separate classification problem.
+- [x] Add an optional macOS 14.2+ process-activity filter for system/UI sounds in Buds automatic switching, without audio capture or polling. Browser media versus notifications from the same process remains a separate classification problem.
+
+## v1.0 RC 1 (54)
+
+System-sound exclusion, consistent switch alignment, disabled-control styling, light sidebar contrast and clearer clipboard/connection wording. All eight pages received detailed screenshot review. See [RC 1 validation and remaining acceptance](docs/RC_1.md).

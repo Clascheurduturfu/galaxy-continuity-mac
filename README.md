@@ -1,9 +1,9 @@
 # Galaxy Continuity for macOS
 
-[![Release: v1.0 Beta 3](https://img.shields.io/badge/release-v1.0%20Beta%203%20(53)-1472FF)](ROADMAP.md)
+[![Release: v1.0 RC 1](https://img.shields.io/badge/release-v1.0%20RC%201%20(54)-1472FF)](ROADMAP.md)
 [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-000000?logo=apple)](Package.swift)
 [![Swift: 6.0+](https://img.shields.io/badge/swift-6.0%2B-F05138?logo=swift)](Package.swift)
-[![Tests: 110 Passing](https://img.shields.io/badge/tests-110%20passing-00C471)](docs/research/validation.md)
+[![Tests: 112 Passing](https://img.shields.io/badge/tests-112%20passing-00C471)](docs/research/validation.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Galaxy Continuity** brings the Samsung Galaxy Book connected ecosystem natively to macOS—written in Swift and SwiftUI, speaking Samsung's wire protocols directly over Bluetooth Low Energy, Classic Bluetooth RFCOMM, LAN Wi-Fi, and Samsung's IMS cloud without requiring a Windows relay or an Android helper app.
@@ -15,7 +15,7 @@
 
 **Transport boundary:** nearby clipboard and large-image transfer are separate from Samsung Internet calling. An overseas native tablet CMC call was owner-confirmed; this does not establish cloud clipboard support or overseas Mac audio.
 
-See [Beta 3 changes and acceptance checks](docs/BETA_3.md) and [privacy review](docs/PRIVACY_REVIEW.md).
+See [RC 1 changes and acceptance checks](docs/RC_1.md) and [privacy review](docs/PRIVACY_REVIEW.md).
 
 ---
 
@@ -28,9 +28,9 @@ See [Beta 3 changes and acceptance checks](docs/BETA_3.md) and [privacy review](
 - **Nearby Devices:** Only physically detected or connected peers are listed. Start Storage Share or Multi Control per device, independently of the clipboard connection.
 - **Contacts:** Load local Mac contacts with explicit permission and select a number to fill the dialer. Nothing is uploaded or called automatically.
 - **Updates:** Stable uses `main` releases; Preview uses `preview` releases. Checks are manual, or optional once per day at launch. Private repositories require a read-only GitHub token. Downloads require GitHub SHA-256, archive bounds and app-signature checks.
-- **Galaxy Buds Auto Switch:** Seamlessly switches paired Galaxy Buds (such as Galaxy Buds3 Pro) to your Mac when macOS audio playback begins, using Samsung's TWU (`0xFC..0xCC`) RFCOMM protocol and MDE Auto Switch V3.
+- **Galaxy Buds Auto Switch:** Seamlessly switches paired Galaxy Buds (such as Galaxy Buds3 Pro) to your Mac when macOS audio playback begins, using Samsung's TWU (`0xFC..0xCC`) RFCOMM protocol and MDE Auto Switch V3. On macOS 14.2+, an optional process-activity filter excludes system alerts from takeover decisions without recording audio; app notifications may still count.
 - **Storage Share (Wireless Finder Mount):** Browse your Galaxy phone's internal storage directly in macOS Finder (`/Volumes/media`) over MCF SDK AppId `10` + temporary per-session SMB credentials, with a reversible host-scoped SMB 2 compatibility lease.
-- **Multi Control (Shared Mouse & Keyboard):** Control your Galaxy phone or tablet with your Mac's trackpad, mouse, and keyboard over MCF SDK AppId `1` with a dedicated `.userInteractive` worker-thread 6 ms UDP pointer pipeline. Arrange devices around a Mac display and optionally cross a shared screen edge; Escape always releases input. Edge/focus behavior still needs device acceptance.
+- **Multi Control (Shared Mouse & Keyboard):** Control your Galaxy phone or tablet with your Mac's trackpad, mouse, and keyboard over MCF SDK AppId `1` with a dedicated `.userInteractive` worker-thread 6 ms UDP pointer pipeline. Arrange devices around a Mac display and optionally cross a shared screen edge; Escape always releases input. Screen-edge switching was accepted by the owner; multi-monitor and long sleep/wake behavior still need broader testing.
 - **Auto Hotspot:** Choose any detected Galaxy phone or tablet and request its mobile hotspot (cellular tethering is required) over the authenticated MCF channel (`AutoHotspotMDE`) and join its Wi-Fi network automatically via CoreWLAN.
 - **One UI Design & Menu Bar Extra:** Native SwiftUI pages, quick tiles, an original app icon and persistent menu bar. Closing the main window hides the Dock icon; Show Window or opening the app recreates it.
 
@@ -73,7 +73,7 @@ See [Beta 3 changes and acceptance checks](docs/BETA_3.md) and [privacy review](
 git clone https://github.com/Clascheurduturfu/galaxy-continuity-mac.git
 cd galaxy-continuity-mac
 
-# Bootstrap calling C libraries, run all 106 unit tests, and build the signed release app
+# Bootstrap calling C libraries, run all 112 unit tests, and build the signed release app
 bash scripts/build-macos.sh
 
 # Install to /Applications and launch

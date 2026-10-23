@@ -43,3 +43,8 @@ All **100 XCTest unit and integration tests** pass with zero network or hardware
 | **Galaxy Buds Auto Switch** | Paired Galaxy Buds3 Pro RFCOMM TWU handshake, multipoint status TLV (`0x0502`), manual takeover, and automatic Mac playback watcher takeover (including from a disconnected Mac start) passed audibly in phone → Mac → phone tests. | Initial ~1–2 s audio plays on Mac speakers while RFCOMM reconnects; brief system alert filtering is on the roadmap. |
 | **Storage Share** | MCF AppId 10 session, on-phone consent prompt, temporary `ksmbd` credentials, scoped SMB 2 compatibility lease, `/Volumes/media` Finder mount, and file create/read/SHA-256/delete passed on Galaxy S26 Ultra. | Mounting a Galaxy Book share from Mac and exporting Mac storage to phone/Book are not yet implemented. |
 | **Multi Control** | MCF AppId 1 session, display layout, focus handoff, worker-thread 6 ms UDP mouse movement (`0` callback stalls > 20 ms), mouse clicks, typing, shortcuts, and `Escape` release verified on Galaxy S26 Ultra and Galaxy Tab S9+. | Comparative smoothness vs. Galaxy Book, automatic screen-edge crossing, keyboard layout negotiation, and drag-and-drop remain open roadmap items. |
+
+
+## RC 1 update
+
+The native regression suite now has 112 passing tests, including system-sound playback policy tests. See [RC 1](../RC_1.md) for current validation, the untested live audio filter boundary and the no-install delivery decision. The earlier matrix above is a historical hardware snapshot; it does not establish simultaneous multi-peer acceptance for the new automatic connection coordinator.

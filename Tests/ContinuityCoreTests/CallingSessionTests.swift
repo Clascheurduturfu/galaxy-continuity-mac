@@ -130,8 +130,12 @@ final class CallingSessionTests: XCTestCase {
     func testMutedSessionSendsOnlySilenceAndEarlyMediaSendsNothing() throws {
         let queue = DispatchQueue(label: "t.m")
         let sock = try CallingUDPSocket(queue: queue, bindAddress: "127.0.0.1"), peer = try CallingUDPSocket(queue: queue, bindAddress: "127.0.0.1")
+        let mediaReceived = expectation(description: "Answered session sends at least six media packets")
         var received = 0
-        peer.startReceiving { _, _, _ in received += 1 }
+        peer.startReceiving { _, _, _ in
+            received += 1
+            if received == 6 { mediaReceived.fulfill() }
+        }
         let key = try CallingSDP.randomKey()
         let plan = CallingMediaPlan(remoteIP: "127.0.0.1", remotePort: Int(peer.port), payloadType: 116, dtmfPayloadType: nil, modeSet: [2], encoderMode: 2,
                                     octetAligned: false, suite: "AES_CM_128_HMAC_SHA1_80", tagBytes: 10, outboundKey: key, inboundKey: key, direction: "sendrecv")
@@ -140,7 +144,7 @@ final class CallingSessionTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.3)
         XCTAssertEqual(queue.sync { received }, 0, "early media must not send the microphone before answer")
         session.setSendEnabled(true)
-        Thread.sleep(forTimeInterval: 0.3)
+        wait(for: [mediaReceived], timeout: 3)
         XCTAssertGreaterThan(queue.sync { received }, 5)
     }
     #endif

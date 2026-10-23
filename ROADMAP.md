@@ -113,6 +113,8 @@ Completed verification boundaries are documented in [docs/research/validation.md
 - **Bluetooth Hands-Free Profile (HFP) Call Prototype (Retired in v1.0 Beta 1):**
   An early spike (`HandsFree.swift`, `IOBluetoothHandsFreeDevice`) explored routing phone calls over classic Bluetooth HFP/SCO. Because macOS does not expose a reliable public HFP Hands-Free Unit audio path for modern Galaxy phones—and because native **Samsung CMC over Wi-Fi/Internet** (`Calling*.swift`) is now fully implemented and live-validated with two-way AMR-WB/SRTP audio—the Bluetooth HFP experiment has been retired and removed from the codebase.
 
-## v1.0 Beta 3 (52) preview
+## v1.0 Beta 3 (53) preview
 
 Automatic nearby account clipboard peers replace manual phone/tablet selection; Clipboard Sync gates both directions while retaining command links for independent features. Buds controls simplified with hover explanations. Private updater token is cleared and its UI hidden after successful public anonymous access. Preview commits, pushes and preview releases are owner-authorized; main/public visibility remain separate. See docs/BETA_3.md for validation and remaining live acceptance.
+
+- [ ] Ignore macOS system/UI sounds when deciding whether Buds auto-switch should take audio. Investigate Core Audio process activity without capturing audio; browser media versus notifications from the same process remains a separate classification problem.

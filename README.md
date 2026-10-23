@@ -1,6 +1,6 @@
 # Galaxy Continuity for macOS
 
-[![Release: v1.0 RC 1](https://img.shields.io/badge/release-v1.0%20RC%201%20(54)-1472FF)](ROADMAP.md)
+[![Release: v1.0](https://img.shields.io/badge/release-v1.0%20(55)-1472FF)](https://github.com/Clascheurduturfu/galaxy-continuity-mac/releases/latest)
 [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-000000?logo=apple)](Package.swift)
 [![Swift: 6.0+](https://img.shields.io/badge/swift-6.0%2B-F05138?logo=swift)](Package.swift)
 [![Tests: 112 Passing](https://img.shields.io/badge/tests-112%20passing-00C471)](docs/research/validation.md)
@@ -11,11 +11,11 @@
 ![Galaxy Continuity — One UI Home Dashboard](docs/images/home-dashboard.png)
 
 
-> Interface images are synthetic demos, not live account captures. Core clipboard and hotspot operation needs no Android helper. The optional Apple hotspot link-icon approach described below requires a separate Android helper; it is not installed or bundled.
+> Interface images are synthetic demos, not live account captures. Core clipboard and hotspot operation needs no Android helper.
 
 **Transport boundary:** nearby clipboard and large-image transfer are separate from Samsung Internet calling. An overseas native tablet CMC call was owner-confirmed; this does not establish cloud clipboard support or overseas Mac audio.
 
-See [RC 1 changes and acceptance checks](docs/RC_1.md) and [privacy review](docs/PRIVACY_REVIEW.md).
+See [v1.0 release notes and validation](docs/V1_0.md) and [privacy review](docs/PRIVACY_REVIEW.md).
 
 ---
 
@@ -27,7 +27,7 @@ See [RC 1 changes and acceptance checks](docs/RC_1.md) and [privacy review](docs
 - **Phone Calls via Samsung CMC:** Place and answer cellular calls from your Mac over Wi-Fi and the Internet using Samsung Call & Text on Other Devices (`SIP/TLS`, RFC 3311 early `UPDATE`, `AMR-WB 16 kHz`, and `SDES SRTP` with macOS `VoiceProcessingIO` echo cancellation).
 - **Nearby Devices:** Only physically detected or connected peers are listed. Start Storage Share or Multi Control per device, independently of the clipboard connection.
 - **Contacts:** Load local Mac contacts with explicit permission and select a number to fill the dialer. Nothing is uploaded or called automatically.
-- **Updates:** Stable uses `main` releases; Preview uses `preview` releases. Checks are manual, or optional once per day at launch. Private repositories require a read-only GitHub token. Downloads require GitHub SHA-256, archive bounds and app-signature checks.
+- **Updates:** Stable uses `main` releases; Preview uses `preview` releases. Checks are manual, or optional once per day at launch. Stable is the default for new installs; public release downloads need no GitHub token. Downloads require GitHub SHA-256, archive bounds and app-signature checks.
 - **Galaxy Buds Auto Switch:** Seamlessly switches paired Galaxy Buds (such as Galaxy Buds3 Pro) to your Mac when macOS audio playback begins, using Samsung's TWU (`0xFC..0xCC`) RFCOMM protocol and MDE Auto Switch V3. On macOS 14.2+, an optional process-activity filter excludes system alerts from takeover decisions without recording audio; app notifications may still count.
 - **Storage Share (Wireless Finder Mount):** Browse your Galaxy phone's internal storage directly in macOS Finder (`/Volumes/media`) over MCF SDK AppId `10` + temporary per-session SMB credentials, with a reversible host-scoped SMB 2 compatibility lease.
 - **Multi Control (Shared Mouse & Keyboard):** Control your Galaxy phone or tablet with your Mac's trackpad, mouse, and keyboard over MCF SDK AppId `1` with a dedicated `.userInteractive` worker-thread 6 ms UDP pointer pipeline. Arrange devices around a Mac display and optionally cross a shared screen edge; Escape always releases input. Screen-edge switching was accepted by the owner; multi-monitor and long sleep/wake behavior still need broader testing.
@@ -132,8 +132,8 @@ Building the project also produces `dist/continuity`, a CLI tool for diagnostics
 
 Released under the [MIT License](LICENSE). See [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) for third-party library licenses.
 
-### Clipboard connections and private preview updates
+### Clipboard connections and updates
 
 Clipboard Sync is one switch for sending and receiving. The Mac automatically authenticates nearby account phones and tablets individually and shares fresh Mac copies with each connected peer, alongside Galaxy Book LAN sessions. There is no phone/tablet picker or per-device activation button. Discovery and account authentication remain required; this is not a cloud broadcast or an Internet clipboard relay. Multi-device live acceptance is recorded in [Beta 3](docs/BETA_3.md).
 
-While the repository is private, use an expiring fine-grained token with Contents: Read for only this repository. The app never embeds a shared token. Update checks try anonymously first; when the repository becomes public, a successful anonymous check deletes the saved updater token and hides the temporary access controls. Delete/revoke the token in GitHub too if it is no longer needed.
+Public updates work without a GitHub token. The temporary access controls were removed in v1.0. A successful anonymous update check deletes any token saved by a previous private build; revoking that token in GitHub remains a separate account action. Stable follows published `main` releases and Preview follows published `preview` releases.

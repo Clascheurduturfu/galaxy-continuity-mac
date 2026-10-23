@@ -18,7 +18,7 @@ private final class UpdateNetworkDelegate: NSObject, URLSessionDownloadDelegate,
 
 @MainActor final class AppUpdates: ObservableObject {
     static let shared = AppUpdates()
-    @Published var channel = UpdateChannel(rawValue: UserDefaults.standard.string(forKey: "updates.channel") ?? "preview") ?? .preview {
+    @Published var channel = UpdateChannel(rawValue: UserDefaults.standard.string(forKey: "updates.channel") ?? "stable") ?? .stable {
         didSet { UserDefaults.standard.set(channel.rawValue, forKey: "updates.channel"); release = nil; status = "Check the \(channel.branch) release channel." }
     }
     @Published var automaticallyCheck = UserDefaults.standard.bool(forKey: "updates.autoCheck") {
@@ -27,9 +27,7 @@ private final class UpdateNetworkDelegate: NSObject, URLSessionDownloadDelegate,
     @Published var status = "Not checked yet."
     @Published var busy = false
     @Published var release: GitHubRelease?
-    @Published var publicRepository: Bool?
-    @Published var token = ""
-    @Published var tokenSaved = !AppVersion.isRenderingDemo && (try? GitHubUpdateCredentials.load()) != nil
+    private var hasLegacyAccess = !AppVersion.isRenderingDemo && (try? GitHubUpdateCredentials.load()) != nil
     private var launchChecked = false
     private let delegate = UpdateNetworkDelegate()
     private lazy var session: URLSession = {
@@ -37,18 +35,12 @@ private final class UpdateNetworkDelegate: NSObject, URLSessionDownloadDelegate,
         configuration.timeoutIntervalForRequest = 30; configuration.timeoutIntervalForResource = 180
         return URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     }()
-    var tokenCreationURL: URL { URL(string: "https://github.com/settings/personal-access-tokens/new?name=Galaxy-Continuity-Updater&target_name=Clascheurduturfu&expires_in=30&contents=read")! }
     var browserURL: URL { URL(string: "https://github.com/\(GitHubRelease.repository)/releases")! }
-    var branchURL: URL { URL(string: "https://github.com/\(GitHubRelease.repository)/tree/\(channel.branch)")! }
-    func saveToken() {
-        do { try GitHubUpdateCredentials.save(token); tokenSaved = !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty; token = ""; status = tokenSaved ? "GitHub read access saved in a private local file." : "GitHub read access removed." }
-        catch { status = "Could not save GitHub access. Use a read-only repository token." }
-    }
     func checkAtLaunchIfEnabled() {
         guard !launchChecked else { return }; launchChecked = true
         // A saved private-repo token also triggers one anonymous probe per launch,
         // so making the repo public removes the token without another user action.
-        if tokenSaved || (automaticallyCheck && Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: "updates.lastCheck") > 86_400) {
+        if hasLegacyAccess || (automaticallyCheck && Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: "updates.lastCheck") > 86_400) {
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "updates.lastCheck"); check()
         }
     }
@@ -70,19 +62,17 @@ private final class UpdateNetworkDelegate: NSObject, URLSessionDownloadDelegate,
                 var (data, response) = try await session.data(for: request(url, authenticated: false))
                 let anonymousStatus = (response as? HTTPURLResponse)?.statusCode
                 if anonymousStatus == 404 || anonymousStatus == 401 {
-                    publicRepository = false
-                    if tokenSaved { (data, response) = try await session.data(for: request(url)) }
+                    if hasLegacyAccess { (data, response) = try await session.data(for: request(url)) }
                 }
                 guard self.channel == channel else { return }
                 guard let response = response as? HTTPURLResponse else { throw ContinuityError.message("GitHub did not return an HTTP response.") }
                 if response.statusCode == 404 || response.statusCode == 401 {
-                    status = "This repository is private or GitHub access expired. Add a read-only token below, or open Releases in your signed-in browser."; return
+                    status = "This repository is private or GitHub access expired. Open Releases in your signed-in browser to download manually."; return
                 }
                 guard response.statusCode == 200, data.count <= 4 * 1024 * 1024 else { throw ContinuityError.message("GitHub could not complete the update check (HTTP \(response.statusCode)).") }
                 let values = try JSONDecoder().decode([GitHubRelease].self, from: data)
                 if anonymousStatus == 200 {
-                    try GitHubUpdateCredentials.save(""); tokenSaved = false; token = ""
-                    publicRepository = true
+                    try GitHubUpdateCredentials.save(""); hasLegacyAccess = false
                 }
                 release = GitHubRelease.newest(values, channel: channel, after: AppVersion.short)
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "updates.lastCheck")
@@ -194,7 +184,7 @@ struct UpdatesCard: View {
             VStack(alignment: .leading, spacing: 12) {
                 Label("App Updates", systemImage: "arrow.down.circle").font(.headline)
                 Picker("Release channel", selection: $updates.channel) {
-                    ForEach(UpdateChannel.allCases, id: \.self) { Text("\($0.title) · \($0.branch)").tag($0) }
+                    ForEach(UpdateChannel.allCases, id: \.self) { Text($0.title).tag($0) }
                 }.pickerStyle(.segmented).disabled(updates.busy)
                 Text(updates.status).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack {
@@ -206,25 +196,7 @@ struct UpdatesCard: View {
                     if updates.busy { ProgressView().controlSize(.small) }
                 }
                 Toggle("Check at launch, at most once a day", isOn: $updates.automaticallyCheck).toggleStyle(OneUIAlignedSwitchStyle())
-                if updates.publicRepository != true {
-                DisclosureGroup("Temporary private repository access") {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Text("Temporary while the repository is private. Create a token with Contents: Read for only galaxy-continuity-mac. It is saved privately on this Mac and automatically deleted when an anonymous update check succeeds after publication.").font(.caption).foregroundStyle(.secondary)
-                        SecureField(updates.tokenSaved ? "Read access saved · enter a replacement" : "GitHub read-only token", text: $updates.token).textFieldStyle(.roundedBorder)
-                        HStack {
-                            Button("Create Read Token…") { NSWorkspace.shared.open(updates.tokenCreationURL) }
-                                .help("Open GitHub's prefilled token form. Choose Only select repositories and galaxy-continuity-mac, then generate a token and paste it here.")
-                            Button("Save Access") { updates.saveToken() }.disabled(updates.token.isEmpty)
-                                .help("Save this read-only token in the Mac's owner-only app credential file; it is not added to source or releases.")
-                            if updates.tokenSaved { Button("Remove Access") { updates.token = ""; updates.saveToken() }.help("Delete the local updater token. This does not revoke it in your GitHub account.") }
-                            Button("Open \(updates.channel.branch) Branch") { NSWorkspace.shared.open(updates.branchURL) }.help("View the source branch used by the selected release channel.")
-                        }
-                    }.padding(.top, 8)
-                }
-                } else {
-                    Text("Public repository · no access token needed. Any saved updater token has been removed from this Mac.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+
             }
         }
     }

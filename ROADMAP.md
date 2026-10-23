@@ -2,7 +2,7 @@
 
 # Galaxy Continuity — Engineering Roadmap & Checklist
 
-Current preview: **v1.0 RC 1 (build 54)**.
+Current stable release: **v1.0 (build 55)**.
 
 Completed verification boundaries are documented in [docs/research/validation.md](docs/research/validation.md), and the architecture and protocol reference index is in [docs/README.md](docs/README.md). Unchecked items below represent open hardening, multi-device edge cases, or unverified protocol surfaces.
 
@@ -122,3 +122,8 @@ Automatic nearby account clipboard peers replace manual phone/tablet selection; 
 ## v1.0 RC 1 (54)
 
 System-sound exclusion, consistent switch alignment, disabled-control styling, light sidebar contrast and clearer clipboard/connection wording. All eight pages received detailed screenshot review. See [RC 1 validation and remaining acceptance](docs/RC_1.md).
+
+
+## v1.0 (55) first stable release
+
+Removed the Apple Personal Hotspot research disclosure and temporary private-repository access controls. New installations default to Stable; saved channel preferences remain respected. Promoted the tested RC1 feature set to main. See [v1.0 release notes](docs/V1_0.md) for validation and remaining platform acceptance.

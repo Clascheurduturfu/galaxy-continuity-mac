@@ -3,10 +3,10 @@ import AppKit
 
 public enum AppVersion {
     public static let appName = "Galaxy Continuity"
-    public static let short = "1.0-rc.1"
-    public static let display = "v1.0 RC 1"
-    public static let build = "54"
-    public static let full = "v1.0 RC 1 (54)"
+    public static let short = "1.0"
+    public static let display = "v1.0"
+    public static let build = "55"
+    public static let full = "v1.0 (55)"
     public static var isRenderingDemo: Bool { CommandLine.arguments.contains("--render-screenshots") }
     public static var isWindowSelfTest: Bool { CommandLine.arguments.contains("--window-lifecycle-selftest") }
 }

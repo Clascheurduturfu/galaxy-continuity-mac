@@ -100,14 +100,7 @@ struct HotspotsPage: View {
                         Text("Samsung enables the hotspot after account authentication. macOS needs Location Services to find and join its Wi-Fi. Nothing is enabled just by opening this page.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                OneUICard {
-                    DisclosureGroup("About the macOS Personal Hotspot menu") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Apple's separate device section uses Apple Account continuity; macOS exposes no public API to insert a Samsung device there. Tetherbug can add the hotspot link icon and metered-network behavior by changing the Android Wi-Fi beacon, using a phone helper and Shizuku. That optional setup is separate from Samsung's native hotspot activation here.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            Link("Tetherbug project and requirements", destination: URL(string: "https://github.com/xav-ie/Tetherbug")!)
-                        }.padding(.top, 10)
-                    }
-                }
+
             }.padding(28)
         }
     }

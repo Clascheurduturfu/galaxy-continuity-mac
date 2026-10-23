@@ -2,7 +2,7 @@
 
 [![Release: v1.0 Beta 3](https://img.shields.io/badge/release-v1.0%20Beta%203%20(52)-1472FF)](ROADMAP.md)
 [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-000000?logo=apple)](Package.swift)
-[![Swift: 5.9+](https://img.shields.io/badge/swift-5.9%2B-F05138?logo=swift)](Package.swift)
+[![Swift: 6.0+](https://img.shields.io/badge/swift-6.0%2B-F05138?logo=swift)](Package.swift)
 [![Tests: 110 Passing](https://img.shields.io/badge/tests-110%20passing-00C471)](docs/research/validation.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

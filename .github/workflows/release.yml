@@ -13,6 +13,8 @@ jobs:
   release:
     if: (inputs.channel == 'preview' && github.ref == 'refs/heads/preview') || (inputs.channel == 'stable' && github.ref == 'refs/heads/main')
     runs-on: macos-14
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - name: Build and test

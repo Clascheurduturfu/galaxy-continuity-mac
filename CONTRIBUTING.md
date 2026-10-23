@@ -5,7 +5,7 @@ Thank you for your interest in contributing to **Galaxy Continuity**!
 ## Development Requirements
 
 - **macOS 13.0+** (Apple Silicon or Intel)
-- **Xcode Command Line Tools** (`swift 5.9+` and `clang`)
+- **Xcode 16+ / Command Line Tools** (`swift 6.0+` and `clang`)
 - **Python 3** (used by `scripts/bootstrap-calling.py` to fetch and verify pinned static C libraries for SRTP and AMR-WB)
 
 ## Building & Running Tests

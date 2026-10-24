@@ -157,12 +157,36 @@ public enum FeatureProtocol {
         let payload = try MCFCrypto.cbcFixed(data, key: key, iv: iv)
         try await transport.send(MCFPacket(handler: 11, sequence: sequence, payload: payload))
     }
+    /// Synchronous `send` for the pointer worker thread (keys, clicks, wheels,
+    /// TCP-fallback movements): same framing, no actor hop.
+    func sendBlocking(_ data: Data) throws {
+        guard iv.count == 16, data.count <= 1_048_576 else { throw ContinuityError.message("Feature channel is not ready or the message is too large.") }
+        let sequence = pointer.nextSequence()
+        let payload = try MCFCrypto.cbcFixed(data, key: key, iv: iv)
+        try transport.sendFrameBlocking(MCFPacket(handler: 11, sequence: sequence, payload: payload).encoded)
+    }
     func receive() async throws -> Data {
         while true {
             let packet = try await transport.receive()
             guard packet.handler == 11 else { throw ContinuityError.message("Unsupported feature packet type \(packet.handler).") }
             return try MCFCrypto.cbc(iv + packet.payload, key: key, encrypt: false)
         }
+    }
+}
+
+/// Lock-protected holder for the primary feature channel, shared between the
+/// main actor (connection lifecycle) and the pointer worker (input sends).
+final class PrimaryChannelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channel: FeatureChannel?
+    func get() -> FeatureChannel? { lock.lock(); defer { lock.unlock() }; return channel }
+    func set(_ value: FeatureChannel?) { lock.lock(); channel = value; lock.unlock() }
+    /// Serialized worker write: a disconnect setting the channel either waits
+    /// for the in-flight frame or makes this throw — it can never interleave.
+    func send(_ data: Data) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard let channel else { throw ContinuityError.message("The feature is not connected.") }
+        try channel.sendBlocking(data)
     }
 }
 
@@ -181,7 +205,13 @@ public enum FeatureProtocol {
     private var inboundCommands: [MCFTransport] = []
     private var channels: [FeatureChannel] = []
     private var readers: [Task<Void, Never>] = []
-    private var primary: FeatureChannel?
+    private let workerChannel = PrimaryChannelBox()
+    /// The authenticated feature channel. Stored behind a lock (`PrimaryChannelBox`)
+    /// so the pointer worker can read it; see `sendFromWorker`.
+    private var primary: FeatureChannel? {
+        get { workerChannel.get() }
+        set { workerChannel.set(newValue) }
+    }
     private var coreConnected = false
     public var isConnected: Bool { primary != nil || coreConnected }
     private var appKey = Data()
@@ -190,6 +220,11 @@ public enum FeatureProtocol {
     public var pointerTransportSummary: String { primary?.pointer.summary ?? "disconnected" }
     /// Thread-safe UDP pointer path of the established feature channel.
     public var pointerSender: PointerSender? { primary?.pointer }
+    /// Synchronous reliable-channel send for the capture worker — keys, clicks,
+    /// wheels and TCP-fallback movements leave without an actor hop, like the
+    /// Book's hook-thread sends. Serialized with channel changes, so a
+    /// concurrent disconnect either waits for the frame or fails the send.
+    public nonisolated func sendFromWorker(_ data: Data) throws { try workerChannel.send(data) }
     public init(appID: UInt8) { self.appID = appID }
     public func connect(profile: ContinuityProfile) async throws {
         try await connect(command: ClipboardSession(connection: try BLEMCFTransport(profile: profile), profile: profile), profile: profile)

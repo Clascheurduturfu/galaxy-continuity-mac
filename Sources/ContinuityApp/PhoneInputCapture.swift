@@ -2,35 +2,19 @@ import AppKit
 import ApplicationServices
 import ContinuityCore
 
-/// Ordered queue for the reliable (TCP) channel, filled by the capture worker
-/// and drained on the main actor. Adjacent movements coalesce.
-final class PhoneInputQueue: @unchecked Sendable, PointerOutput {
-    private let lock = NSLock()
-    private var items: [PhoneInput] = []
-    let wakeups: AsyncStream<Void>
-    private let continuation: AsyncStream<Void>.Continuation
-    private let sender: PointerSender?
-    private let gate: AtomicFlag
-    init(sender: PointerSender?, gate: AtomicFlag) {
-        var captured: AsyncStream<Void>.Continuation!
-        wakeups = AsyncStream(Void.self, bufferingPolicy: .bufferingNewest(1)) { captured = $0 }
-        continuation = captured; self.sender = sender; self.gate = gate
-    }
-    var isControlling: Bool { gate.value }
+/// Output for the pointer worker thread: movements leave over UDP with a
+/// direct `sendto`, and everything else (keys, clicks, wheels, TCP-fallback
+/// movements) is written synchronously onto the reliable channel. The whole
+/// input path stays on the worker thread with no main-actor hops.
+final class PhoneInputOutput: @unchecked Sendable, PointerOutput {
+    private let udp: PointerSender?
+    let reliable: ReliableInputSender
+    init(udp: PointerSender?, reliable: ReliableInputSender) { self.udp = udp; self.reliable = reliable }
+    var isControlling: Bool { reliable.isControlling }
     func sendPointer(x: Int, y: Int, elapsed: UInt8) -> PointerSendOutcome {
-        sender?.send(MultiControlWire.motion(x: x, y: y, elapsed: elapsed)) ?? .unavailable
+        udp?.send(MultiControlWire.motion(x: x, y: y, elapsed: elapsed)) ?? .unavailable
     }
-    func enqueue(_ input: PhoneInput) -> Int {
-        lock.lock()
-        if case let .move(x, y, elapsed) = input, case let .move(a, b, _)? = items.last { items[items.count - 1] = .move(a + x, b + y, elapsed) }
-        else { items.append(input) }
-        let depth = items.count
-        lock.unlock()
-        continuation.yield()
-        return depth
-    }
-    func pop() -> PhoneInput? { lock.lock(); defer { lock.unlock() }; return items.isEmpty ? nil : items.removeFirst() }
-    func finish() { lock.lock(); items = []; lock.unlock(); continuation.finish() }
+    func enqueue(_ input: PhoneInput) -> Int { reliable.send(input) }
 }
 
 /// Owns the CGEvent tap, the pacer timers and the pipeline on ONE thread: a
@@ -39,8 +23,9 @@ final class PhoneInputQueue: @unchecked Sendable, PointerOutput {
 final class PointerCaptureEngine: @unchecked Sendable {
     let options: PointerOptions
     let telemetry: PointerTelemetry
-    private let queue: PhoneInputQueue
+    private let output: PointerOutput
     private let pipeline: PointerPipeline
+    private var wheelPacer = WheelPacer()
     private let running = AtomicFlag()
     private let stateLock = NSLock()
     private var tornDown = false, started = false
@@ -65,9 +50,9 @@ final class PointerCaptureEngine: @unchecked Sendable {
         96:0x3f,97:0x40,98:0x41,99:0x3d,100:0x42,101:0x43,103:0x57,109:0x44,111:0x58,115:0xe047,
         116:0xe049,117:0xe053,118:0x3e,119:0xe04f,120:0x3c,121:0xe051,122:0x3b,123:0xe04b,124:0xe04d,125:0xe050,126:0xe048]
 
-    init(options: PointerOptions, queue: PhoneInputQueue, telemetry: PointerTelemetry) {
-        self.options = options; self.queue = queue; self.telemetry = telemetry
-        pipeline = PointerPipeline(output: queue, telemetry: telemetry)
+    init(options: PointerOptions, output: PointerOutput, telemetry: PointerTelemetry) {
+        self.options = options; self.output = output; self.telemetry = telemetry
+        pipeline = PointerPipeline(output: output, telemetry: telemetry)
         pipeline.onFailure = { [weak self] message in self?.end(message) }
     }
 
@@ -170,8 +155,10 @@ final class PointerCaptureEngine: @unchecked Sendable {
         if options.placement == .worker, let runLoop { CFRunLoopStop(runLoop) }
         Unmanaged.passUnretained(self).release()
     }
-    /// Engine-initiated end (Escape, tap disabled, pipeline failure). Events pass through to the Mac immediately.
-    private func end(_ reason: String?) {
+    /// Engine-initiated end (Escape, tap disabled, pipeline or channel failure).
+    /// Called from the capture worker or the main actor; events pass through to
+    /// the Mac immediately.
+    func end(_ reason: String?) {
         guard running.value else { return }
         running.value = false
         schedule { [self] in teardown() }
@@ -196,7 +183,19 @@ final class PointerCaptureEngine: @unchecked Sendable {
         case .leftMouseDown,.leftMouseUp: pipeline.input(.click(1, type == .leftMouseDown))
         case .rightMouseDown,.rightMouseUp: pipeline.input(.click(2, type == .rightMouseDown))
         case .otherMouseDown,.otherMouseUp: pipeline.input(.click(3, type == .otherMouseDown))
-        case .scrollWheel: pipeline.input(.wheel(Int(event.getIntegerValueField(.scrollWheelEventDeltaAxis2)) * 120, Int(event.getIntegerValueField(.scrollWheelEventDeltaAxis1)) * 120))
+        case .scrollWheel:
+            // Trackpad streams are decimated 1-in-12 like the Book's touchpad
+            // handling (with accumulation, so distance is kept); discrete
+            // mouse-wheel notches pass straight through. Scroll phase 4/5 is
+            // ended/cancelled, momentum phase 3 is ended.
+            let vertical = Int(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
+            let horizontal = Int(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
+            let phase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
+            let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+            let ended = phase >= 4 || momentum == 3
+            if let wheel = wheelPacer.add(x: vertical * 120, y: horizontal * 120, continuous: phase != 0 || momentum != 0, ended: ended) {
+                pipeline.input(.wheel(wheel.x, wheel.y))
+            }
         default: break
         }
         return nil
@@ -204,11 +203,11 @@ final class PointerCaptureEngine: @unchecked Sendable {
 }
 
 /// Explicit keyboard/mouse capture. Escape, sleep and tap failure release it.
-/// UI state only; capture, pacing, encryption and UDP send live in the engine.
+/// UI state only; capture, pacing, encryption, UDP sends and the reliable
+/// channel writes all run on the engine's worker thread.
 @MainActor final class PhoneInputCapture {
     private var engine: PointerCaptureEngine?
-    private var queue: PhoneInputQueue?
-    private var consumer: Task<Void, Never>?
+    private var output: PhoneInputOutput?
     private var sleepObserver: NSObjectProtocol?
     private weak var controller: MultiControl?
     private(set) var active = false
@@ -221,27 +220,14 @@ final class PointerCaptureEngine: @unchecked Sendable {
             _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
             throw ContinuityError.message("Allow Galaxy Continuity Lab in Mac Accessibility settings, then choose Control phone again.")
         }
-        guard let sender = controller.pointerSender else { throw ContinuityError.message("Multi Control is not connected.") }
-        let queue = PhoneInputQueue(sender: sender, gate: controller.controlGate)
-        let engine = PointerCaptureEngine(options: PointerOptions.load(), queue: queue, telemetry: PointerTelemetry())
+        guard let udp = controller.pointerSender else { throw ContinuityError.message("Multi Control is not connected.") }
+        let reliable = controller.makeInputSender()
+        let output = PhoneInputOutput(udp: udp, reliable: reliable)
+        let engine = PointerCaptureEngine(options: PointerOptions.load(), output: output, telemetry: PointerTelemetry())
+        reliable.onUnavailable = { [weak engine] message in engine?.end(message) }
         engine.onEnded = { [weak self] reason in Task { @MainActor in self?.engineEnded(reason) } }
         try engine.start()
-        self.controller = controller; self.engine = engine; self.queue = queue; active = true
-        consumer = Task { @MainActor [weak self] in
-            for await _ in queue.wakeups {
-                while let input = queue.pop() {
-                    guard let self, self.active, let controller = self.controller else { return }
-                    do {
-                        switch input {
-                        case let .key(code, down): try await controller.key(code, down: down)
-                        case let .click(button, down): try await controller.click(button, down: down)
-                        case let .move(x, y, elapsed): try await controller.motion(x: x, y: y, elapsed: elapsed)
-                        case let .wheel(x, y): try await controller.motion(x: x, y: y, wheel: true)
-                        }
-                    } catch { self.stop(); self.failed?(error.localizedDescription); return }
-                }
-            }
-        }
+        self.controller = controller; self.engine = engine; self.output = output; active = true
         _ = CGAssociateMouseAndMouseCursorPosition(0); _ = CGDisplayHideCursor(CGMainDisplayID())
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in Task { @MainActor in self?.stop() } }
     }
@@ -253,13 +239,14 @@ final class PointerCaptureEngine: @unchecked Sendable {
     func stop() {
         guard active else { return }; active = false
         engine?.stop()   // flushes the final delta while control is still held
+        output?.reliable.releaseHeld()   // release any held key or button before focus returns
         if let engine {
             let snapshot = engine.telemetry.snapshot()
             if snapshot.udpSent + snapshot.fallbacks > 0 {
                 summary?("Mouse: \(controller?.pointerTransportSummary ?? "disconnected") [\(engine.options.description)]\n" + snapshot.text)
             }
         }
-        consumer?.cancel(); consumer = nil; queue?.finish(); queue = nil; engine = nil
+        output = nil
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }; sleepObserver = nil
         _ = CGAssociateMouseAndMouseCursorPosition(1); _ = CGDisplayShowCursor(CGMainDisplayID())
         ended?()

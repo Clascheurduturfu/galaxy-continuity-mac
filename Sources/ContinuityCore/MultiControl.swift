@@ -24,6 +24,48 @@ public enum MultiControlWire {
     public static var focusReleaseMarker: Data { motion(x: PointerVector.reserved.x, y: PointerVector.reserved.y) }
 }
 
+/// Direct input path for the capture worker: keys, clicks, wheels and
+/// TCP-fallback movements go straight onto the feature channel with no actor
+/// hop, mirroring the Book's hook-thread sends. Tracks held keys and buttons
+/// so a control hand-back can always release them.
+public final class ReliableInputSender: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pressedKeys: Set<UInt16> = []
+    private var pressedButtons: Set<UInt8> = []
+    private let send: (Data) throws -> Void
+    private let gate: AtomicFlag
+    /// Called on the capture worker when the channel rejects input; the engine ends control.
+    public var onUnavailable: ((String) -> Void)?
+    public init(gate: AtomicFlag, send: @escaping (Data) throws -> Void) { self.gate = gate; self.send = send }
+    public var isControlling: Bool { gate.value }
+    /// Sends one input; returns the reliable queue depth (always 0 now that
+    /// sends are synchronous), matching the `PointerOutput` contract.
+    public func send(_ input: PhoneInput) -> Int {
+        guard gate.value else { return 0 }
+        do {
+            switch input {
+            case let .key(code, down):
+                try send(MultiControlWire.key(scanCode: code, down: down))
+                lock.lock(); if down { pressedKeys.insert(code) } else { pressedKeys.remove(code) }; lock.unlock()
+            case let .click(button, down):
+                try send(MultiControlWire.click(button: button, down: down))
+                lock.lock(); if down { pressedButtons.insert(button) } else { pressedButtons.remove(button) }; lock.unlock()
+            case let .move(x, y, elapsed):
+                for packet in MultiControlWire.pointerPackets(x: x, y: y, elapsed: elapsed) { try send(packet) }
+            case let .wheel(x, y):
+                try send(MultiControlWire.motion(x: x, y: y, wheel: true, elapsed: 0))
+            }
+        } catch { onUnavailable?(error.localizedDescription) }
+        return 0
+    }
+    /// Releases anything still held when control ends; bypasses the gate by design.
+    public func releaseHeld() {
+        lock.lock(); let keys = pressedKeys; let buttons = pressedButtons; pressedKeys = []; pressedButtons = []; lock.unlock()
+        for key in keys { try? send(MultiControlWire.key(scanCode: key, down: false)) }
+        for button in buttons { try? send(MultiControlWire.click(button: button, down: false)) }
+    }
+}
+
 @MainActor public final class MultiControl {
     private let session = FeatureSession(appID: 1)
     private var ownID = ""
@@ -150,6 +192,11 @@ public enum MultiControlWire {
     public var pointerTransportSummary: String { session.pointerTransportSummary }
     /// Thread-safe UDP movement path for the capture worker; nil when not connected.
     public var pointerSender: PointerSender? { session.pointerSender }
+    /// Builds the worker-thread sender for keys, clicks, wheels and fallback
+    /// movements; captures the session reference once, on the main actor.
+    public func makeInputSender() -> ReliableInputSender {
+        ReliableInputSender(gate: controlGate) { [session] data in try session.sendFromWorker(data) }
+    }
     public func motion(x: Int, y: Int, wheel: Bool = false, elapsed: UInt8 = 0) async throws {
         guard controlling else { return }
         // Movement reaches this reliable path only when UDP is unavailable.

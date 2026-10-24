@@ -187,6 +187,24 @@ final class PointerPipelineTests: XCTestCase {
         XCTAssertEqual(PointerOptions.parse(["IPTOS": "184"]).ipTOS, 184)
         XCTAssertNil(PointerOptions.parse(["IPTOS": "999"]).ipTOS)
         XCTAssertEqual(PointerOptions.parse(["Pacing": "bogus"]).pacing, PointerOptions().pacing)
+        // The Book's UDP QoS policy is the default; 0 downgrades to best effort.
+        XCTAssertEqual(PointerOptions().ipTOS, 0xC0)
+        XCTAssertEqual(PointerOptions.parse(["IPTOS": "0"]).ipTOS, 0)
+    }
+
+    func testWheelPacerDecimatesContinuousAndPassesDiscrete() throws {
+        var pacer = WheelPacer()
+        // A continuous trackpad stream releases one accumulated packet per 12 events.
+        for i in 1...11 { XCTAssertNil(pacer.add(x: i, y: 0, continuous: true, ended: false)) }
+        XCTAssertEqual(pacer.add(x: 12, y: 0, continuous: true, ended: false), PointerVector(78, 0))
+        // The end of a gesture or momentum run flushes the partial tail.
+        XCTAssertNil(pacer.add(x: 2, y: 1, continuous: true, ended: false))
+        XCTAssertEqual(pacer.add(x: 0, y: 0, continuous: true, ended: true), PointerVector(2, 1))
+        // Discrete mouse-wheel notches pass straight through.
+        XCTAssertEqual(pacer.add(x: 3, y: 4, continuous: false, ended: false), PointerVector(3, 4))
+        // A discrete notch after a partial trackpad stream flushes both together.
+        XCTAssertNil(pacer.add(x: 5, y: 0, continuous: true, ended: false))
+        XCTAssertEqual(pacer.add(x: 1, y: 2, continuous: false, ended: false), PointerVector(6, 2))
     }
 
     func testSenderWithoutSocketDeclinesAndCountsFallback() throws {

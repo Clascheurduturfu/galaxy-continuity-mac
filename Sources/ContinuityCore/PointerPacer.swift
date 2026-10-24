@@ -15,6 +15,33 @@ public struct PointerVector: Equatable, Sendable {
     }
 }
 
+/// Wheel rate limiting copied from the Book's `SendMouseEvent`: continuous
+/// (trackpad-style) scroll streams release one packet per `stride` events
+/// instead of flooding the reliable channel, while discrete mouse-wheel
+/// notches pass through untouched — the Book decimates only when the source
+/// is a touchpad. Skipped deltas are accumulated, so the phone still scrolls
+/// the full distance.
+public struct WheelPacer {
+    public let stride: Int
+    private var x = 0, y = 0, events = 0
+    public init(stride: Int = 12) { self.stride = max(1, stride) }
+    /// Returns the vector to send now, or nil while still accumulating.
+    /// `ended` marks the end of a trackpad gesture or momentum run and flushes.
+    public mutating func add(x: Int, y: Int, continuous: Bool, ended: Bool) -> PointerVector? {
+        guard continuous else {
+            guard events > 0 else { return PointerVector(x, y) }
+            // A discrete notch after a trackpad stream is a boundary: flush both.
+            let merged = PointerVector(self.x + x, self.y + y)
+            reset(); return merged
+        }
+        self.x += x; self.y += y; events += 1
+        guard events >= stride || ended else { return nil }
+        let flush = PointerVector(self.x, self.y)
+        reset(); return flush
+    }
+    public mutating func reset() { x = 0; y = 0; events = 0 }
+}
+
 /// Match the Book's 6 ms movement cadence while retaining the final movement
 /// even when no subsequent OS event arrives. Times use a monotonic clock.
 public struct PointerPacer {

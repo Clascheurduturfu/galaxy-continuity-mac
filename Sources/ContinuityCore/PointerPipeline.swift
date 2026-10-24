@@ -8,7 +8,8 @@ public enum PhoneInput: Sendable, Equatable {
 public protocol PointerOutput: AnyObject {
     var isControlling: Bool { get }
     func sendPointer(x: Int, y: Int, elapsed: UInt8) -> PointerSendOutcome
-    /// Appends to the ordered reliable-channel queue and returns its depth.
+    /// Sends the input over the reliable channel (synchronously on the capture
+    /// thread); returns the queue depth it produced, or 0 when immediate.
     func enqueue(_ input: PhoneInput) -> Int
 }
 
@@ -106,8 +107,10 @@ public struct PointerOptions: Equatable, Sendable {
     public enum Placement: String, Sendable { case worker, main }
     public var pacing: Pacing = .event
     public var placement: Placement = .worker
-    /// Explicit IP_TOS byte for the UDP socket (for example 0x10 low-delay); nil leaves only the service class.
-    public var ipTOS: Int?
+    /// IP_TOS byte for the UDP socket. The default 0xC0 is DSCP CS6, the
+    /// marking the Book requests via `ApplyQoSPolicyAsync(UDP, LowDelay, 48)`;
+    /// set 0 to downgrade to plain best effort.
+    public var ipTOS: Int? = 0xC0
     /// Send the (-100,-100) focus-release marker when control returns to the Mac.
     public var releaseMarker = false
     public init() {}

@@ -30,7 +30,14 @@ jobs:
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Galaxy Continuity Lab.app/Contents/Info.plist')
           branch=main
           flags=()
-          if [[ "$CHANNEL" == preview ]]; then branch=preview; flags+=(--prerelease); fi
+          if [[ "$CHANNEL" == preview ]]; then
+            branch=preview; flags+=(--prerelease)
+            # One rolling preview: earlier pre-releases are removed so only the
+            # newest preview build stays listed (their git tags are kept).
+            while IFS= read -r previous; do
+              [[ -n "$previous" ]] && gh release delete "$previous" --yes || true
+            done < <(gh release list --limit 100 --json tagName,isPrerelease --jq '.[] | select(.isPrerelease) | .tagName')
+          fi
           if [[ "$CHANNEL" == stable && "$version" == *-* ]]; then echo 'Stable releases require a final version.'; exit 1; fi
           gh release create "v$version" --target "$branch" --title "Galaxy Continuity $version" --generate-notes "${flags[@]}" \
             "dist/GalaxyContinuity-$version-macOS-arm64.zip" \

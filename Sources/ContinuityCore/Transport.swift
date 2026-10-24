@@ -11,15 +11,6 @@ private final class ConnectionCompletion: @unchecked Sendable {
     }
 }
 
-/// Error slot for the synchronous worker-thread send; the completion runs on
-/// the connection's own queue, the waiter on the pointer worker.
-private final class SendFailure: @unchecked Sendable {
-    private let lock = NSLock()
-    private var error: Error?
-    func store(_ error: Error?) { lock.lock(); self.error = error; lock.unlock() }
-    func take() -> Error? { lock.lock(); defer { lock.unlock() }; return error }
-}
-
 @MainActor public protocol MCFConnection: AnyObject {
     func connect() async throws
     func cancel()
@@ -55,25 +46,19 @@ public final class MCFTransport: MCFConnection {
     }
     func sendFrame(_ frame: Data) async throws {
         guard frame.count <= ProtoWire.maximumFrame else { throw ContinuityError.message("Outgoing frame is too large.") }
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             socket.send(content: ProtoWire.varint(UInt64(frame.count)) + frame, completion: .contentProcessed { error in
                 if let error { continuation.resume(throwing: error) } else { continuation.resume() }
             })
         }
     }
-    /// Synchronous `sendFrame` for the pointer worker thread. NWConnection is
-    /// thread-safe; blocking until the TCP stack accepts the frame (normally
-    /// microseconds) keeps strict key/click/wheel ordering without an actor hop.
-    public func sendFrameBlocking(_ frame: Data) throws {
-        guard frame.count <= ProtoWire.maximumFrame else { throw ContinuityError.message("Outgoing frame is too large.") }
-        let signaled = DispatchSemaphore(value: 0)
-        let failure = SendFailure()
-        socket.send(content: ProtoWire.varint(UInt64(frame.count)) + frame, completion: .contentProcessed { error in
-            failure.store(error)
-            signaled.signal()
-        })
-        guard signaled.wait(timeout: .now() + 1.0) == .success else { throw ContinuityError.message("The feature channel did not accept the input in time.") }
-        if let error = failure.take() { throw error }
+    /// Raw pre-framed socket write for synchronous sends off the main actor
+    /// (the pointer worker). Captured on the main actor; NWConnection itself
+    /// is thread-safe, so the closure can run from any thread.
+    var blockingWriter: (Data, @escaping (Error?) -> Void) -> Void {
+        { [socket] content, completion in
+            socket.send(content: content, completion: .contentProcessed { error in completion(error) })
+        }
     }
     private func more() async throws {
         let data: Data = try await withCheckedThrowingContinuation { continuation in

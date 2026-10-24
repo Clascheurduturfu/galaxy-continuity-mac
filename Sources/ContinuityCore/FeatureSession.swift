@@ -157,13 +157,12 @@ public enum FeatureProtocol {
         let payload = try MCFCrypto.cbcFixed(data, key: key, iv: iv)
         try await transport.send(MCFPacket(handler: 11, sequence: sequence, payload: payload))
     }
-    /// Synchronous `send` for the pointer worker thread (keys, clicks, wheels,
-    /// TCP-fallback movements): same framing, no actor hop.
-    func sendBlocking(_ data: Data) throws {
-        guard iv.count == 16, data.count <= 1_048_576 else { throw ContinuityError.message("Feature channel is not ready or the message is too large.") }
-        let sequence = pointer.nextSequence()
-        let payload = try MCFCrypto.cbcFixed(data, key: key, iv: iv)
-        try transport.sendFrameBlocking(MCFPacket(handler: 11, sequence: sequence, payload: payload).encoded)
+    /// Worker-thread sender snapshot: the handshake-fixed key/IV, the shared
+    /// packet sequence and a raw socket writer captured on the main actor.
+    /// NWConnection is thread-safe, so its blocking write needs no actor hop.
+    func makeWorkerSender() -> WorkerChannelSender? {
+        guard iv.count == 16 else { return nil }
+        return WorkerChannelSender(key: key, iv: iv, sequence: pointer, write: transport.blockingWriter)
     }
     func receive() async throws -> Data {
         while true {
@@ -174,19 +173,54 @@ public enum FeatureProtocol {
     }
 }
 
-/// Lock-protected holder for the primary feature channel, shared between the
-/// main actor (connection lifecycle) and the pointer worker (input sends).
-final class PrimaryChannelBox: @unchecked Sendable {
+/// Error slot for the synchronous worker send; the completion runs on the
+/// connection's own queue, the waiter on the pointer worker.
+private final class SendFailure: @unchecked Sendable {
     private let lock = NSLock()
-    private var channel: FeatureChannel?
-    func get() -> FeatureChannel? { lock.lock(); defer { lock.unlock() }; return channel }
-    func set(_ value: FeatureChannel?) { lock.lock(); channel = value; lock.unlock() }
-    /// Serialized worker write: a disconnect setting the channel either waits
-    /// for the in-flight frame or makes this throw — it can never interleave.
+    private var error: Error?
+    func store(_ error: Error?) { lock.lock(); self.error = error; lock.unlock() }
+    func take() -> Error? { lock.lock(); defer { lock.unlock() }; return error }
+}
+
+/// Immutable snapshot of an authenticated channel for the pointer worker:
+/// handshake-fixed key and IV, the shared packet sequence, and a raw socket
+/// writer captured on the main actor. `send` blocks only until the TCP stack
+/// accepts the frame (normally microseconds), preserving input order.
+final class WorkerChannelSender: @unchecked Sendable {
+    private let key: Data
+    private let iv: Data
+    private let sequence: PointerSender
+    private let write: (Data, @escaping (Error?) -> Void) -> Void
+    init(key: Data, iv: Data, sequence: PointerSender, write: @escaping (Data, @escaping (Error?) -> Void) -> Void) {
+        self.key = key; self.iv = iv; self.sequence = sequence; self.write = write
+    }
+    func send(_ data: Data) throws {
+        guard data.count <= 1_048_576 else { throw ContinuityError.message("Feature channel is not ready or the message is too large.") }
+        let payload = try MCFCrypto.cbcFixed(data, key: key, iv: iv)
+        let packet = MCFPacket(handler: 11, sequence: sequence.nextSequence(), payload: payload).encoded
+        let signaled = DispatchSemaphore(value: 0)
+        let failure = SendFailure()
+        write(ProtoWire.varint(UInt64(packet.count)) + packet) { error in
+            failure.store(error)
+            signaled.signal()
+        }
+        guard signaled.wait(timeout: .now() + 1.0) == .success else { throw ContinuityError.message("The feature channel did not accept the input in time.") }
+        if let error = failure.take() { throw error }
+    }
+}
+
+/// Lock-protected holder for the worker sender, shared between the main
+/// actor (connection lifecycle) and the pointer worker (input sends).
+final class WorkerSendBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sender: WorkerChannelSender?
+    func set(_ value: WorkerChannelSender?) { lock.lock(); sender = value; lock.unlock() }
+    /// Serialized worker write: a disconnect replacing the sender either waits
+    /// for the in-flight frame or fails the send — it can never interleave.
     func send(_ data: Data) throws {
         lock.lock(); defer { lock.unlock() }
-        guard let channel else { throw ContinuityError.message("The feature is not connected.") }
-        try channel.sendBlocking(data)
+        guard let sender else { throw ContinuityError.message("The feature is not connected.") }
+        try sender.send(data)
     }
 }
 
@@ -205,13 +239,8 @@ final class PrimaryChannelBox: @unchecked Sendable {
     private var inboundCommands: [MCFTransport] = []
     private var channels: [FeatureChannel] = []
     private var readers: [Task<Void, Never>] = []
-    private let workerChannel = PrimaryChannelBox()
-    /// The authenticated feature channel. Stored behind a lock (`PrimaryChannelBox`)
-    /// so the pointer worker can read it; see `sendFromWorker`.
-    private var primary: FeatureChannel? {
-        get { workerChannel.get() }
-        set { workerChannel.set(newValue) }
-    }
+    private var primary: FeatureChannel?
+    private let workerSender = WorkerSendBox()
     private var coreConnected = false
     public var isConnected: Bool { primary != nil || coreConnected }
     private var appKey = Data()
@@ -224,8 +253,13 @@ final class PrimaryChannelBox: @unchecked Sendable {
     /// wheels and TCP-fallback movements leave without an actor hop, like the
     /// Book's hook-thread sends. Serialized with channel changes, so a
     /// concurrent disconnect either waits for the frame or fails the send.
-    public nonisolated func sendFromWorker(_ data: Data) throws { try workerChannel.send(data) }
+    public nonisolated func sendFromWorker(_ data: Data) throws { try workerSender.send(data) }
     public init(appID: UInt8) { self.appID = appID }
+    /// Installs (or clears) the primary channel and its worker sender together.
+    private func activate(_ channel: FeatureChannel?) {
+        primary = channel
+        workerSender.set(channel?.makeWorkerSender())
+    }
     public func connect(profile: ContinuityProfile) async throws {
         try await connect(command: ClipboardSession(connection: try BLEMCFTransport(profile: profile), profile: profile), profile: profile)
     }
@@ -301,7 +335,7 @@ final class PrimaryChannelBox: @unchecked Sendable {
                         do {
                             try await channel.authenticate(accepting: true)
                             if accepting, let self, self.generation == attempt {
-                                self.primary = channel
+                                self.activate(channel)
                                 let pending = self.response; self.response = nil; pending?.resume(returning: Data())
                             }
                             try await self?.read(channel, generation: attempt)
@@ -355,7 +389,7 @@ final class PrimaryChannelBox: @unchecked Sendable {
             channels.append(channel)
             try await channel.authenticate()
             guard generation == attempt, !Task.isCancelled else { throw CancellationError() }
-            primary = channel
+            activate(channel)
             if !channel.pointer.setupSummary.isEmpty { status?(channel.pointer.setupSummary) }
             readers.append(Task { [weak self] in
                 do { try await self?.read(channel, generation: attempt) }
@@ -428,6 +462,6 @@ final class PrimaryChannelBox: @unchecked Sendable {
         commandListener?.cancel(); commandListener = nil
         inboundCommands.forEach { $0.cancel() }; inboundCommands = []
         readers.forEach { $0.cancel() }; readers = []
-        channels.forEach { $0.close() }; channels = []; primary = nil; coreConnected = false; appKey = Data(); peerIP = nil
+        channels.forEach { $0.close() }; channels = []; activate(nil); coreConnected = false; appKey = Data(); peerIP = nil
     }
 }

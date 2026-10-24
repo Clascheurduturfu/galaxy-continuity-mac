@@ -185,7 +185,8 @@ final class PointerPipelineTests: XCTestCase {
         let o = PointerOptions.parse(["Pacing": "EVENT", "Placement": "main", "IPTOS": "0x10", "ReleaseMarker": "true"])
         XCTAssertEqual(o.pacing, .event); XCTAssertEqual(o.placement, .main); XCTAssertEqual(o.ipTOS, 16); XCTAssertTrue(o.releaseMarker)
         XCTAssertEqual(PointerOptions.parse(["IPTOS": "184"]).ipTOS, 184)
-        XCTAssertNil(PointerOptions.parse(["IPTOS": "999"]).ipTOS)
+        // Out-of-range values keep the CS6 default rather than clearing it.
+        XCTAssertEqual(PointerOptions.parse(["IPTOS": "999"]).ipTOS, 0xC0)
         XCTAssertEqual(PointerOptions.parse(["Pacing": "bogus"]).pacing, PointerOptions().pacing)
         // The Book's UDP QoS policy is the default; 0 downgrades to best effort.
         XCTAssertEqual(PointerOptions().ipTOS, 0xC0)

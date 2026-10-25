@@ -37,7 +37,7 @@ static void GCLLog(NSString *format, ...) {
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [[NSProcessInfo processInfo] processName], message];
-    FILE *file = fopen(GCLPath("hook.log").fileSystemRepresentation, "a");
+    FILE *file = fopen(GCLPath(@"hook.log").fileSystemRepresentation, "a");
     if (file) { fputs(line.UTF8String, file); fclose(file); }
 }
 
@@ -58,7 +58,7 @@ static NSDictionary *GCLReadJSON(NSString *name) {
 
 static BOOL GCLAvailableFresh(void) {
     struct stat info;
-    if (stat(GCLPath("available").fileSystemRepresentation, &info) != 0) return NO;
+    if (stat(GCLPath(@"available").fileSystemRepresentation, &info) != 0) return NO;
     return time(NULL) - info.st_mtime <= 10;
 }
 
@@ -92,7 +92,15 @@ static GCLStatus GCLLoadStatus(void) {
 static BOOL GCLConnectedToHotspot(void) {
     GCLStatus st = GCLLoadStatus();
     if (!st.ok || st.ssid.length == 0) return NO;
-    id interface = ((id (*)(id, SEL)) objc_msgSend)([CWWiFiClient sharedClient], @selector(interface));
+    Class wifiClient = NSClassFromString(@"CWWiFiClient");
+    id client = nil, interface = nil;
+    if (wifiClient) {
+        SEL factories[3] = {@selector(sharedClient), @selector(sharedWiFiClient), @selector(shared)};
+        for (int i = 0; i < 3 && !client; i++) {
+            if ([wifiClient respondsToSelector:factories[i]]) client = ((id (*)(id, SEL)) objc_msgSend)(wifiClient, factories[i]);
+        }
+    }
+    if ([client respondsToSelector:@selector(interface)]) interface = ((id (*)(id, SEL)) objc_msgSend)(client, @selector(interface));
     if (!interface) return NO;
     NSString *current = ((NSString *(*)(id, SEL)) objc_msgSend)(interface, @selector(ssid));
     return [current isEqualToString:st.ssid];
@@ -213,9 +221,9 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
     NSData *ssidData = [ssid dataUsingEncoding:NSUTF8StringEncoding];
     NSArray *networks = nil;
     if ([self respondsToSelector:@selector(scanForNetworksWithSSID:error:)]) {
-        networks = ((NSArray *(*)(id, SEL, NSData, NSError **)) objc_msgSend)(self, @selector(scanForNetworksWithSSID:error:), ssidData, NULL);
+        networks = ((NSArray *(*)(id, SEL, NSData *, NSError **)) objc_msgSend)(self, @selector(scanForNetworksWithSSID:error:), ssidData, NULL);
     } else if ([self respondsToSelector:@selector(scanForNetworksForSSID:error:)]) {
-        networks = ((NSArray *(*)(id, SEL, NSData, NSError **)) objc_msgSend)(self, @selector(scanForNetworksForSSID:error:), ssidData, NULL);
+        networks = ((NSArray *(*)(id, SEL, NSData *, NSError **)) objc_msgSend)(self, @selector(scanForNetworksForSSID:error:), ssidData, NULL);
     } else if ([self respondsToSelector:@selector(scanForNetworksWithError:)]) {
         NSArray *all = ((NSArray *(*)(id, SEL, NSError **)) objc_msgSend)(self, @selector(scanForNetworksWithError:), NULL);
         networks = [all filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"ssid == %@", ssid]];

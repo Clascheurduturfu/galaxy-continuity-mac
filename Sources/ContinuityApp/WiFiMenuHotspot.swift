@@ -137,14 +137,14 @@ import ContinuityCore
         handling = true
         defer { handling = false; removeFile(Self.triggerFile) }
         guard let live = liveSession?(), let center, let capability else { writeCreds(nil, reason: -1); return }
-        let answer = center.cached(address: live.address)
-            ?? (try? await live.session.requestHotspotAnswer(timeout: 15))
+        var answer = center.cached(address: live.address)
+        if answer == nil { answer = try? await live.session.requestHotspotAnswer(timeout: 15) }
         guard let answer else { writeCreds(nil, reason: -1); return }
         center.store(address: live.address, credentials: answer)
         if answer.isSuccess == true { capability.markAvailable(live.address) } else { capability.markUnavailable(live.address, reason: answer.mhsfailed_reason) }
         writeCreds(answer)
     }
-    private func writeCreds(_ answer: HotspotCredentials?, reason: Int) {
+    private func writeCreds(_ answer: HotspotCredentials?, reason: Int = -1) {
         let payload: [String: Any] = [
             "isSuccess": answer?.isSuccess == true,
             "ssid": answer?.ssid ?? "",

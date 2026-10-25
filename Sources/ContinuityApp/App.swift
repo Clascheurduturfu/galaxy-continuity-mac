@@ -117,6 +117,11 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     var lastChange = NSPasteboard.general.changeCount
     var joiningHotspot = false
     var hotspotJoiner = HotspotJoiner()
+    /// On-demand hotspot answers: cached 20 s, invalidated on wake/disconnect.
+    let hotspotCenter = HotspotCenter()
+    /// Devices that answered "no hotspot" are excluded from new queries.
+    let hotspotCapability = HotspotCapabilityMemory()
+    let wifiMenu = WiFiMenuHotspot()
     let discovery = ContinuityDiscovery()
     private static let backoffSchedule = [2, 5, 10, 20, 45, 60]
 
@@ -192,6 +197,14 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         }
         nearbyClipboard.changed = { [weak self] in self?.updateNearbyConnections() }
         nearbyClipboard.status = { [weak self] in self?.trace($0) }
+        wifiMenu.center = hotspotCenter
+        wifiMenu.capability = hotspotCapability
+        wifiMenu.note = { [weak self] in self?.note($0) }
+        wifiMenu.liveSession = { [weak self] in
+            guard let self, self.connected, let session = self.session, !self.selectedTarget.isEmpty else { return nil }
+            return (session, self.selectedTarget, self.targetDisplayName)
+        }
+        if wifiMenu.enabled { wifiMenu.refreshSIP() }
         installSystemObservers()
 
         let args = CommandLine.arguments
@@ -268,6 +281,8 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 Task { @MainActor in
                     guard let self else { return }
                     self.trace("Mac woke from sleep; refreshing Galaxy continuity links.")
+                    self.hotspotCenter.invalidate()   // re-ask the phone after wake
+                    self.wifiMenu.invalidateCache()
                     self.reconnectAttempt = 0
                     self.lanPresence?.connectPCs()
                     if self.autoConnect, !self.userPaused, !self.connected, !self.busy {
@@ -483,7 +498,17 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         receiveClipboard(from: session)
         session.hotspotReceived = { [weak self] value in
             guard let self else { return }
-            guard value.isSuccess == true else { self.joiningHotspot = false; self.hotspotBusy = false; self.note("The phone rejected Auto Hotspot (reason \(value.mhsfailed_reason ?? -1))."); return }
+            let address = session.peerAddress ?? self.selectedTarget
+            guard value.isSuccess == true else {
+                self.joiningHotspot = false; self.hotspotBusy = false
+                if !address.isEmpty { self.hotspotCapability.markUnavailable(address, reason: value.mhsfailed_reason) }
+                self.note("The phone rejected Auto Hotspot (reason \(value.mhsfailed_reason ?? -1)). It is excluded from hotspot requests for 24 h (retry from the Auto Hotspot page).")
+                return
+            }
+            if !address.isEmpty {
+                self.hotspotCenter.store(address: address, credentials: value)
+                self.hotspotCapability.markAvailable(address)
+            }
             self.note("The phone enabled Auto Hotspot and returned its connection details.")
             if self.joiningHotspot {
                 self.joiningHotspot = false
@@ -499,6 +524,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 session.stop()
                 if self.session === session {
                     busy = false; connected = false
+                    hotspotCenter.invalidate(address: session.peerAddress ?? selectedTarget)   // far away → re-ask next time
                     updateNearbyConnections()
                     if shouldRetry { scheduleReconnect() }
                 }

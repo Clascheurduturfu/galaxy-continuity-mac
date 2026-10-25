@@ -59,3 +59,55 @@ public struct HotspotCredentials: Decodable, Sendable {
         guard interface.ssid() == ssid else { throw ContinuityError.message("Wi-Fi association did not complete.") }
     }
 }
+
+/// Cache for Auto Hotspot answers, keyed by Bluetooth address. Queries are
+/// on demand only (button click, Wi-Fi-menu open, Wi-Fi-menu click); a cached
+/// answer is reused for `freshWindow` seconds, and everything is dropped on
+/// wake, disconnect or any explicit invalidation — after that the phone is
+/// re-asked over the existing session.
+@MainActor public final class HotspotCenter {
+    /// Inside the 15–30 s window the user asked for.
+    public static let freshWindow: TimeInterval = 20
+    private var cache: [String: (credentials: HotspotCredentials, at: Date)] = [:]
+    public init() {}
+    /// A still-fresh answer for the device, or nil when it must be re-requested.
+    public func cached(address: String) -> HotspotCredentials? {
+        guard let entry = cache[address], Date().timeIntervalSince(entry.at) <= Self.freshWindow else { return nil }
+        return entry.credentials
+    }
+    public func store(address: String, credentials: HotspotCredentials) { cache[address] = (credentials, Date()) }
+    public func invalidate(address: String? = nil) {
+        if let address { cache[address] = nil } else { cache.removeAll() }
+    }
+}
+
+/// Remembers which nearby devices answered the hotspot request with a
+/// failure, so they are excluded from new requests and hidden from the
+/// Wi-Fi menu entry instead of being asked again on every interaction.
+@MainActor public final class HotspotCapabilityMemory {
+    /// How long a "no hotspot" verdict is trusted before it can be re-checked.
+    public static let trustWindow: TimeInterval = 24 * 3600
+    private let defaults: UserDefaults
+    private let key = "hotspot.unavailableDevices"
+    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    private func table() -> [String: Double] {
+        guard let data = defaults.data(forKey: key), let value = try? JSONDecoder().decode([String: Double].self, from: data) else { return [:] }
+        return value
+    }
+    private func store(_ table: [String: Double]) {
+        guard let data = try? JSONEncoder().encode(table.filter { Date().timeIntervalSince1970 - $0.value < Self.trustWindow }) else { return }
+        defaults.set(data, forKey: key)
+    }
+    /// True while a recorded failure is still trusted.
+    public func unavailable(_ address: String) -> Bool {
+        guard let at = table()[address] else { return false }
+        return Date().timeIntervalSince1970 - at < Self.trustWindow
+    }
+    public func markUnavailable(_ address: String, reason: Int?) {
+        var value = table(); value[address] = Date().timeIntervalSince1970; store(value)
+    }
+    /// A successful answer (or a retry by the user) clears the verdict.
+    public func markAvailable(_ address: String) {
+        var value = table(); value[address] = nil; store(value)
+    }
+}

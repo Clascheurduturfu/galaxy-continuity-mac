@@ -92,6 +92,8 @@ public enum ClipboardContext {
     public var received: ((ClipboardText) -> Void)?
     public var status: ((String) -> Void)?
     public var hotspotReceived: ((HotspotCredentials) -> Void)?
+    /// Waiters for `requestHotspotAnswer`; resumed by the type-4 reply.
+    private var hotspotWaiters: [CheckedContinuation<HotspotCredentials, Error>] = []
     public var clientCommandReceived: ((MCFCommand) -> Void)?
     public var tcpOfferReceived: ((Data) -> Void)?
     public func applicationKey(_ appID: UInt8) throws -> Data {
@@ -198,6 +200,30 @@ public enum ClipboardContext {
         try await send(handler: 6, command: MCFCommand(id: 3, type: 3, payload: Data([4, 0]) + HotspotCredentials.request()))
         status?("Requested Samsung Auto Hotspot. Waiting for the phone…")
     }
+    /// Sends the type-3 request and suspends until the phone's type-4 answer
+    /// arrives on this session (or the timeout passes). Existing
+    /// `hotspotReceived` subscribers still see the answer.
+    public func requestHotspotAnswer(timeout: TimeInterval = 15) async throws -> HotspotCredentials {
+        guard !key.isEmpty else { throw ContinuityError.message("Connect before requesting Auto Hotspot.") }
+        try await send(handler: 6, command: MCFCommand(id: 3, type: 3, payload: Data([4, 0]) + HotspotCredentials.request()))
+        status?("Requested Samsung Auto Hotspot. Waiting for the phone…")
+        let deadline = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.failHotspotWaiters(ContinuityError.message("The phone did not answer the Auto Hotspot request in time."))
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            hotspotWaiters.append(continuation)
+        }
+    }
+    private func resumeHotspotWaiters(_ value: HotspotCredentials) {
+        let waiters = hotspotWaiters; hotspotWaiters = []
+        waiters.forEach { $0.resume(returning: value) }
+    }
+    private func failHotspotWaiters(_ error: Error) {
+        let waiters = hotspotWaiters; hotspotWaiters = []
+        waiters.forEach { $0.resume(throwing: error) }
+    }
     private func observe(_ context: Data, advertisement: Bool = false) async throws {
         guard !key.isEmpty, let event = try ClipboardContext.event(context), event.sequence != 0, lastRequested != event.sequence || (advertisement && suppressedSequence == event.sequence) else { return }
         let sequence = event.sequence
@@ -283,7 +309,7 @@ public enum ClipboardContext {
             let bytes = Array(command.payload)
             if bytes.count > 2, bytes[0] == 4, bytes[1] == 0 {
                 let value = try JSONDecoder().decode(HotspotCredentials.self, from: Data(bytes.dropFirst(2)))
-                if value.messagetype == 4 { hotspotReceived?(value) }
+                if value.messagetype == 4 { resumeHotspotWaiters(value); hotspotReceived?(value) }
             }
             return
         }
@@ -343,5 +369,5 @@ public enum ClipboardContext {
         }
         throw ContinuityError.message("The phone's Wi-Fi command handover did not authenticate.")
     }
-    public func stop() { transfer?.stop(); transfer = nil; handover?.stop(); handover = nil; clientHandlers = [:]; connection.cancel(); key = Data() }
+    public func stop() { failHotspotWaiters(ContinuityError.message("The Galaxy session ended before the hotspot answered.")); transfer?.stop(); transfer = nil; handover?.stop(); handover = nil; clientHandlers = [:]; connection.cancel(); key = Data() }
 }

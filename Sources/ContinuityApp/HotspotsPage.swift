@@ -15,8 +15,12 @@ import ContinuityCore
     private var received = false
     private var generation = UUID()
     private let joiner = HotspotJoiner()
+    /// Cached answers and device capability come from the shared LabModel state.
+    var center: HotspotCenter?
+    var capability: HotspotCapabilityMemory?
     func join(profile base: ContinuityProfile, peer: NearbyPeer, existing: ClipboardSession?) {
         guard !busy, peer.nearby else { return }
+        guard capability?.unavailable(peer.address) != true else { status = "\(peer.name) reported no mobile hotspot. Retry checks again."; return }
         var profile = base; profile.preferredPeerAddress = peer.address
         busy = true; target = peer.address; received = false
         generation = UUID(); let generation = self.generation
@@ -33,7 +37,12 @@ import ContinuityCore
                 self.joinTask = Task {
                     defer { if self.generation == generation { self.finish() } }
                     do {
-                        guard credentials.isSuccess == true else { throw ContinuityError.message("This device declined the hotspot request (reason \(credentials.mhsfailed_reason ?? -1)). It may not have cellular tethering available.") }
+                        guard credentials.isSuccess == true else {
+                            self.capability?.markUnavailable(peer.address, reason: credentials.mhsfailed_reason)
+                            throw ContinuityError.message("This device declined the hotspot request (reason \(credentials.mhsfailed_reason ?? -1)). It is excluded for 24 h; retry from this page.")
+                        }
+                        self.center?.store(address: peer.address, credentials: credentials)
+                        self.capability?.markAvailable(peer.address)
                         self.status = "Hotspot accepted. Joining Wi-Fi…"
                         try await self.joiner.join(credentials)
                         if self.generation == generation { self.status = "Connected to \(peer.name)'s hotspot." }
@@ -48,7 +57,13 @@ import ContinuityCore
             operation = Task {
                 do {
                     if self.ownsSession { try await command.connect() }
-                    try await command.requestHotspot()
+                    // A still-fresh cached answer skips the radio query entirely.
+                    if let cached = self.center?.cached(address: peer.address), cached.isSuccess == true {
+                        self.status = "Using the hotspot answer cached moments ago."
+                        command.hotspotReceived?(cached)
+                    } else {
+                        try await command.requestHotspot()
+                    }
                     if self.ownsSession { try await command.run() }
                 } catch {
                     if self.generation == generation, !self.received && !Task.isCancelled { self.status = error.localizedDescription; self.finish() }
@@ -57,6 +72,13 @@ import ContinuityCore
         } catch { status = error.localizedDescription; finish() }
     }
     func cancel() { generation = UUID(); joinTask?.cancel(); joinTask = nil; finish(); status = "Hotspot request cancelled." }
+    /// Clears a stored "no hotspot" verdict so the device can be re-checked.
+    func retry(peer: NearbyPeer) {
+        capability?.markAvailable(peer.address)
+        center?.invalidate(address: peer.address)
+        status = "\(peer.name) will be asked again next time."
+        objectWillChange.send()
+    }
     private func finish() {
         timeout?.cancel(); timeout = nil; operation?.cancel(); operation = nil
         if ownsSession { session?.stop() } else { session?.hotspotReceived = previousHandler }
@@ -73,31 +95,48 @@ struct HotspotsPage: View {
             VStack(alignment: .leading, spacing: 18) {
                 OneUIPageHeader("Auto Hotspot", subtitle: "Connect through any nearby Galaxy with mobile tethering, using its own hotspot connection")
                 ForEach(peers) { peer in
-                    OneUICard {
-                        HStack(spacing: 14) {
-                            Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(OneUI.blue)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(peer.name).font(.headline)
-                                Text("Nearby · hotspot availability checked when requested").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button(hotspots.busy && hotspots.target == peer.address ? "Connecting…" : "Connect") {
-                                if let profile = model.profile {
-                                    let existing = model.connected && model.selectedTarget == peer.address ? model.session : nil
-                                    hotspots.join(profile: profile, peer: peer, existing: existing)
+                    if model.hotspotCapability.unavailable(peer.address) {
+                        OneUICard {
+                            HStack(spacing: 14) {
+                                Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(peer.name).font(.headline)
+                                    Text("No hotspot — this device declined the request. Excluded for 24 h; Wi-Fi-only models cannot tether.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 }
-                            }.buttonStyle(OneUIPrimaryButtonStyle()).disabled(hotspots.busy)
+                                Spacer()
+                                Button("Retry") { hotspots.retry(peer: peer) }.buttonStyle(OneUISecondaryButtonStyle())
+                            }
+                        }
+                    } else {
+                        OneUICard {
+                            HStack(spacing: 14) {
+                                Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(OneUI.blue)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(peer.name).font(.headline)
+                                    Text("Nearby · hotspot availability checked when requested").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(hotspots.busy && hotspots.target == peer.address ? "Connecting…" : "Connect") {
+                                    if let profile = model.profile {
+                                        let existing = model.connected && model.selectedTarget == peer.address ? model.session : nil
+                                        hotspots.center = model.hotspotCenter
+                                        hotspots.capability = model.hotspotCapability
+                                        hotspots.join(profile: profile, peer: peer, existing: existing)
+                                    }
+                                }.buttonStyle(OneUIPrimaryButtonStyle()).disabled(hotspots.busy)
+                            }
                         }
                     }
                 }
                 if peers.isEmpty {
                     OneUICard { Text("No nearby phone or tablet detected. Turn on Bluetooth and Samsung Auto Hotspot on the device. Wi-Fi-only tablets cannot provide mobile tethering.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.vertical, 22) }
                 }
+                WiFiMenuHotspotCard(wifiMenu: model.wifiMenu)
                 OneUICard {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(hotspots.status).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         if hotspots.busy { Button("Cancel Request") { hotspots.cancel() } }
-                        Text("Samsung enables the hotspot after account authentication. macOS needs Location Services to find and join its Wi-Fi. Nothing is enabled just by opening this page.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Text("Samsung enables the hotspot after account authentication. macOS needs Location Services to find and join its Wi-Fi. Queries run only on demand, answers are cached 20 s, and devices that decline are remembered.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

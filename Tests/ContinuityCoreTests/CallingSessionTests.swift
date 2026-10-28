@@ -89,8 +89,12 @@ final class CallingSessionTests: XCTestCase {
         let queue = DispatchQueue(label: "t.replace")
         let socket = try CallingUDPSocket(queue: queue, bindAddress: "127.0.0.1")
         let peer = try CallingUDPSocket(queue: queue, bindAddress: "127.0.0.1")
+        let mediaReceived = expectation(description: "Replacement session sends at least six packets")
         var received = 0
-        peer.startReceiving { _, _, _ in received += 1 }
+        peer.startReceiving { _, _, _ in
+            received += 1
+            if received == 6 { mediaReceived.fulfill() }
+        }
         let key = try CallingSDP.randomKey()
         let plan = CallingMediaPlan(remoteIP: "127.0.0.1", remotePort: Int(peer.port), payloadType: 116, dtmfPayloadType: nil, modeSet: [2], encoderMode: 2,
                                     octetAligned: false, suite: "AES_CM_128_HMAC_SHA1_80", tagBytes: 10, outboundKey: key, inboundKey: key, direction: "sendrecv")
@@ -99,7 +103,7 @@ final class CallingSessionTests: XCTestCase {
         let final = try CallingMediaSession(plan: plan, socket: socket, audio: CallingMemoryAudio(), queue: queue)
         final.setSendEnabled(true); try final.start()
         defer { final.stop(); peer.close() }
-        Thread.sleep(forTimeInterval: 0.3)
+        wait(for: [mediaReceived], timeout: 3)
         XCTAssertGreaterThan(queue.sync { received }, 5)
         XCTAssertEqual(queue.sync { final.stats.sendFailures }, 0)
         XCTAssertEqual(final.localPort, socket.port)
@@ -118,15 +122,19 @@ final class CallingSessionTests: XCTestCase {
         audio.capture.write([Int16](repeating: 12000, count: 8000))
         let decrypt = try CallingSRTP(outboundKey: key, inboundKey: key, ssrc: 123, tagBytes: 10)
         let decoder = try CallingCodec()
+        let silenceReceived = expectation(description: "Early keepalive delivers six decoded silence frames")
         var samples = [Int16]()
         peer.startReceiving { data, _, _ in
             if let clear = try? decrypt.unprotect(data), let rtp = try? CallingRTP(packet: clear),
-               let pcm = try? decoder.decode(rtp.payload, octetAligned: false) { samples += pcm }
+               let pcm = try? decoder.decode(rtp.payload, octetAligned: false) {
+                let previous = samples.count; samples += pcm
+                if previous <= 1600 && samples.count > 1600 { silenceReceived.fulfill() }
+            }
         }
         let session = try CallingMediaSession(plan: plan, socket: sock, audio: audio, queue: queue)
         session.setEarlyKeepalive(true); try session.start()
         defer { session.stop(); peer.close() }
-        Thread.sleep(forTimeInterval: 0.3)
+        wait(for: [silenceReceived], timeout: 3)
         let snapshot = queue.sync { (session.stats, samples) }
         XCTAssertGreaterThan(snapshot.0.sent, 5); XCTAssertGreaterThan(snapshot.1.count, 1600)
         XCTAssertEqual(snapshot.0.captureTicks, 0, "No microphone frames may be read before answer")

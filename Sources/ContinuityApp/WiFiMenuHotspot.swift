@@ -150,7 +150,7 @@ import Darwin
         }
         let payload: [String: Any] = [
             "name": live.name, "battery": center?.information(address: live.address)?.batteryPercent ?? -1,
-            "ssid": center?.cached(address: live.address)?.ssid ?? ""
+            "ssid": center?.lastSSID(address: live.address) ?? ""
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.statusFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statusFile.path) }
         FileManager.default.createFile(atPath: Self.availableFile.path, contents: nil, attributes: [.modificationDate: Date(), .posixPermissions: 0o600])

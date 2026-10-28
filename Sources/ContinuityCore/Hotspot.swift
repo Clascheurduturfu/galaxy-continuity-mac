@@ -82,6 +82,8 @@ public struct HotspotInformation: Decodable, Sendable {
     public static let freshWindow: TimeInterval = 20
     private var cache: [String: (credentials: HotspotCredentials, at: Date)] = [:]
     private var information: [String: (HotspotInformation, Date)] = [:]
+    private var knownSSIDs: [String: String] = [:]
+    public func lastSSID(address: String) -> String? { knownSSIDs[address] }
     public static let informationWindow: TimeInterval = 300
     public init() {}
     public func information(address: String) -> HotspotInformation? {
@@ -94,9 +96,12 @@ public struct HotspotInformation: Decodable, Sendable {
         guard let entry = cache[address], Date().timeIntervalSince(entry.at) <= Self.freshWindow else { return nil }
         return entry.credentials
     }
-    public func store(address: String, credentials: HotspotCredentials) { cache[address] = (credentials, Date()) }
+    public func store(address: String, credentials: HotspotCredentials) {
+        cache[address] = (credentials, Date())
+        if credentials.isSuccess == true, let ssid = credentials.ssid, !ssid.isEmpty { knownSSIDs[address] = ssid }
+    }
     public func invalidate(address: String? = nil) {
-        if let address { cache[address] = nil; information[address] = nil } else { cache.removeAll(); information.removeAll() }
+        if let address { cache[address] = nil; information[address] = nil; knownSSIDs[address] = nil } else { cache.removeAll(); information.removeAll(); knownSSIDs.removeAll() }
     }
 }
 

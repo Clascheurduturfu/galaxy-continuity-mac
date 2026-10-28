@@ -258,8 +258,10 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         wifiMenu.liveSession = { [weak self] in
             guard let self else { return nil }
             let peers = (self.profile?.peers ?? []).sorted { ($0.deviceType == "phone" ? 0 : 1) < ($1.deviceType == "phone" ? 0 : 1) }
-            for peer in peers {
-                if let session = self.clipboardSession(for: peer.address), self.hotspotCenter.information(address: peer.address) != nil, !self.hotspotCapability.unavailable(peer.address) {
+            for peer in peers where !self.hotspotCapability.unavailable(peer.address) {
+                if let session = self.clipboardSession(for: peer.address) {
+                    // Availability is checked by the publisher. The lookup must also
+                    // work with an expired cache so menu opening can refresh it.
                     return (session, peer.address, peer.name)
                 }
             }

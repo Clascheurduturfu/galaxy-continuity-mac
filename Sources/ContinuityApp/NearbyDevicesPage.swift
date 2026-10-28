@@ -28,6 +28,7 @@ struct NearbyDevicesPage: View {
             }.padding(28)
         }
         .onAppear { features.ensurePlacements(peers.map(\.address)) }
+        .onAppear { model.refreshHotspotInformation() }
         .onChange(of: peers.map(\.address)) { features.ensurePlacements($0) }
     }
 }
@@ -53,6 +54,7 @@ private struct NearbyFeatureCard: View {
                     Image(systemName: peer.symbol).font(.system(size: 28)).foregroundStyle(OneUI.blue).frame(width: 42)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(peer.name).font(.system(size: 18, weight: .bold, design: .rounded))
+                        if let battery = model.batteryPercent(for: peer.address) { DeviceBatteryBadge(percent: battery) }
                         Text(peer.connected ? "Connected" : peer.bluetoothNearby ? "Nearby over Bluetooth" : "Found on local network").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()

@@ -187,6 +187,18 @@ enum HotspotInformationQueryState { case checking, unanswered }
         return GalaxyPeerPreference.home(peers: peers, connected: clipboardSessions.compactMap(\.peerAddress), nearby: nearbyPeers.filter(\.nearby).map(\.address), selected: selectedTarget)
     }
     var homeConnected: Bool { homePeer.flatMap { clipboardSession(for: $0.address) } != nil }
+    func batteryPercent(for address: String) -> Int? {
+        hotspotCenter.information(address: address)?.batteryPercent
+            ?? clipboardSession(for: address)?.peerAddress.flatMap { hotspotCenter.information(address: $0)?.batteryPercent }
+    }
+    var connectedPeers: [ContinuityProfile.Peer] {
+        (profile?.peers ?? []).filter { clipboardSession(for: $0.address) != nil }.sorted {
+            let leftPrimary = $0.address == homePeer?.address, rightPrimary = $1.address == homePeer?.address
+            if leftPrimary != rightPrimary { return leftPrimary }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+    var activePeer: ContinuityProfile.Peer? { connectedPeers.first }
 
     let discovery = ContinuityDiscovery()
     private static let backoffSchedule = [2, 5, 10, 20, 45, 60]
@@ -209,7 +221,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
     var visualState: ConnectionVisualState {
         guard profile != nil else { return .signedOut }
         if userPaused { return .paused }
-        if connected { return .connected(targetDisplayName) }
+        if hasClipboardLinks { return .connected(activePeer?.name ?? "Galaxy devices") }
         if busy { return .connecting(targetDisplayName) }
         if reconnectSecondsRemaining > 0 {
             return .reconnecting(attempt: max(1, reconnectAttempt), secondsRemaining: reconnectSecondsRemaining)
@@ -661,6 +673,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
     func receiveClipboard(from session: ClipboardSession, name: String? = nil) {
         session.clipboardEnabled = automaticClipboard
         let peerName = name ?? targetDisplayName
+        session.status = { [weak self] message in self?.note("\(peerName): \(message)") }
         session.received = { [weak self, weak session] clip in
             guard let self, self.automaticClipboard, session?.clipboardEnabled == true else { return }
             self.receivedText = clip.text
@@ -670,7 +683,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
             self.lastClipboardDate = Date()
             let board = NSPasteboard.general; board.clearContents(); board.setString(clip.text, forType: .string)
             if let html = clip.html { board.setString(html, forType: .html) }
-            self.lastChange = board.changeCount; self.note("Received phone text and placed it on the Mac clipboard.")
+            self.lastChange = board.changeCount; self.note("Received text from \(peerName) and placed it on the Mac clipboard.")
             self.notifyClipboardArrival(summary: "Text copied from \(peerName)")
         }
         session.receivedImage = { [weak self, weak session] data in
@@ -686,7 +699,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
             }
             if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
             let board = NSPasteboard.general; board.clearContents(); board.writeObjects([item])
-            self.lastChange = board.changeCount; self.note("Received phone image and placed it on the Mac clipboard.")
+            self.lastChange = board.changeCount; self.note("Received an image from \(peerName) and placed it on the Mac clipboard.")
             self.notifyClipboardArrival(summary: "Image (\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))) copied from \(peerName)")
         }
     }
@@ -972,6 +985,9 @@ private struct SidebarStatusFooter: View {
                 Text(headline)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
+                if let peer = model.activePeer, let battery = model.batteryPercent(for: peer.address) {
+                    DeviceBatteryBadge(percent: battery)
+                }
             }
             Text(model.status)
                 .font(.system(size: 10))
@@ -1144,7 +1160,7 @@ private struct HeroDeviceCard: View {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .fill(
                                 LinearGradient(
-                                    colors: model.connected ? [OneUI.blue, OneUI.deepBlue] : [Color.primary.opacity(0.10), Color.primary.opacity(0.05)],
+                                    colors: model.homeConnected ? [OneUI.blue, OneUI.deepBlue] : [Color.primary.opacity(0.10), Color.primary.opacity(0.05)],
                                     startPoint: .topLeading,
                                     endPoint: .bottomTrailing
                                 )
@@ -1152,7 +1168,7 @@ private struct HeroDeviceCard: View {
                             .frame(width: 66, height: 66)
                         Image(systemName: model.homePeer?.deviceType?.lowercased() == "phone" ? "iphone.gen3" : "ipad")
                             .font(.system(size: 30, weight: .semibold))
-                            .foregroundStyle(model.connected ? Color.white : Color.primary)
+                            .foregroundStyle(model.homeConnected ? Color.white : Color.primary)
                     }
 
                     VStack(alignment: .leading, spacing: 5) {
@@ -1168,10 +1184,10 @@ private struct HeroDeviceCard: View {
                                     .background(Capsule().fill(Color.primary.opacity(0.07)))
                             }
                         }
-                        if let peer = model.homePeer, let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
-                            Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary)
+                        if let peer = model.homePeer, let battery = model.batteryPercent(for: peer.address) {
+                            DeviceBatteryBadge(percent: battery)
                         }
-                        Text(model.homeConnected ? "Authenticated clipboard session active with this device." : (model.connected ? "This phone is not connected. Other Galaxy device connections remain active." : subtitleText))
+                        Text(model.homeConnected ? "Authenticated clipboard session active with this device." : (model.hasClipboardLinks ? "This device is not connected. Other Galaxy device connections remain active." : subtitleText))
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
@@ -1205,7 +1221,7 @@ private struct HeroDeviceCard: View {
                             }
                             .buttonStyle(OneUIPrimaryButtonStyle())
                             .disabled(model.signingIn)
-                        } else if model.connected || model.busy {
+                        } else if model.hasClipboardLinks || model.busy {
                             Button("Pause Device Connections") {
                                 model.pauseConnection()
                             }
@@ -1273,7 +1289,7 @@ private struct RecentClipboardCard: View {
                             .frame(width: 72, height: 72)
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Photo Received from Phone")
+                            Text("Photo Received from Galaxy")
                                 .font(.system(size: 14, weight: .semibold))
                             Text(ByteCountFormatter.string(fromByteCount: Int64(model.receivedImageBytes), countStyle: .file) + " · Ready to paste (⌘V)")
                                 .font(.system(size: 12))
@@ -1346,6 +1362,7 @@ private struct NearbyEcosystemCard: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(peer.name)
                                         .font(.system(size: 13, weight: .semibold))
+                                    if let battery = model.batteryPercent(for: peer.address) { DeviceBatteryBadge(percent: battery) }
                                     Text(peer.connected ? "Connected" : peer.bluetoothNearby ? "Nearby over Bluetooth" : "Found on local network")
                                         .font(.system(size: 11))
                                         .foregroundStyle(.secondary)
@@ -1598,18 +1615,35 @@ struct MenuBarExtraView: View {
     @ObservedObject var buds: BudsModel
     @ObservedObject var calls: CallingController
     @ObservedObject var hotspots: HotspotsModel
+    private var connectionText: String {
+        if model.userPaused { return "Connection Paused" }
+        guard model.hasClipboardLinks else { return model.status }
+        if model.homeConnected, let peer = model.homePeer { return "Connected to \(peer.name)" }
+        if let peer = model.activePeer { return "Other device connected · \(peer.name)" }
+        return "Galaxy device connections active"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("\(AppVersion.appName) · \(AppVersion.display)")
                 .font(.headline)
-            Text(model.connected ? "Connected to \(model.targetDisplayName)" : (model.userPaused ? "Connection Paused" : model.status))
+            Text(connectionText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let peer = model.activePeer, let battery = model.batteryPercent(for: peer.address) {
+                Text("Battery · \(battery)%").font(.caption).foregroundStyle(.secondary)
+            }
+            if model.connectedPeers.count > 1 {
+                Menu("Connected Devices") {
+                    ForEach(model.connectedPeers, id: \.address) { peer in
+                        Text(peer.name + (model.batteryPercent(for: peer.address).map { " · \($0)%" } ?? ""))
+                    }
+                }
+            }
 
             Divider()
 
-            Button("Send Mac Clipboard to Phone") {
+            Button("Send Mac Clipboard to Galaxy Devices") {
                 model.sendClipboard()
             }
             .disabled(!model.automaticClipboard || !model.hasClipboardLinks)
@@ -1635,7 +1669,7 @@ struct MenuBarExtraView: View {
 
             Divider()
 
-            if model.connected || model.busy {
+            if model.hasClipboardLinks || model.busy {
                 Button("Pause Automatic Connection") {
                     model.pauseConnection()
                 }
@@ -1656,6 +1690,7 @@ struct MenuBarExtraView: View {
                 NSApplication.shared.terminate(nil)
             }
         }
+        .onAppear { model.refreshHotspotInformation() }
     }
 }
 
@@ -1696,7 +1731,7 @@ struct MenuBarExtraView: View {
         }
         .defaultSize(width: 960, height: 680)
 
-        MenuBarExtra(AppVersion.appName, systemImage: model.connected ? "iphone.radiowaves.left.and.right" : "iphone") {
+        MenuBarExtra(AppVersion.appName, systemImage: model.hasClipboardLinks ? "iphone.radiowaves.left.and.right" : "iphone") {
             MenuBarExtraView(model: model, buds: buds, calls: CallingController.shared, hotspots: hotspots)
         }
     }

@@ -1,6 +1,6 @@
 # Auto Hotspot: native macOS Wi-Fi menu integration
 
-Status: Beta 4, 2026-10-28 (Beta 3 repairs plus hotspot-query UI correction). The private research checkout retains both
+Status: Beta 5, 2026-10-28 (Beta 3 repairs, query lifecycle and battery UI corrections). The private research checkout retains both
 `AUTO_HOTSPOT_RESEARCH.md` and the original v4 Objective-C source. They were
 not lost; temporary copies disappearing from `/tmp` did not remove these files.
 
@@ -144,8 +144,8 @@ So the DYLD hook is the only known way to a real Personal Hotspots entry.
 - Full SIP disable weakens OS protections while on; the option is off by
   default and clearly labelled.
 - Private selectors/property layout shift across macOS releases — the hook
-  logs every hook/KVC outcome to `hook.log` so failures are diagnosable.
-  `launchctl unsetenv` + restart restores stock behavior instantly.
+  keeps bounded initialization diagnostics in `hook.log`. Disabling the
+  integration restores the stock agent definitions and restarts them.
 - Library Validation/AMFI can still block injection into some system
   binaries on specific versions even with SIP off — if the entry does not
   appear, check `hook.log` for missing-method lines.
@@ -154,9 +154,14 @@ So the DYLD hook is the only known way to a real Personal Hotspots entry.
 
 ## 5. Known limitations
 
-- Battery/bars/network in the fake entry are placeholder values (88/4/5G)
-  until phone-context packets provide real ones.
-- Single-device: the entry reflects the currently connected session target.
+- Battery is Samsung-reported when available; cellular bars and network
+  generation remain unknown and are not fabricated. The original proof of
+  concept's 88/4/5G values were placeholders, replaced by the repaired path.
+- Single-device Wi-Fi entry: prefers a live phone session. Other nearby
+  device connections remain independent.
 - The fake entry hides while already connected (dedup) instead of showing a
   connected state — fine for now, revisit with `CWDisplayedScanResult`
   filtering if needed.
+
+See [battery and native-widget research](battery-widget.md) for the precise
+status source, tablet limitation, signal-field analysis and registry probe.

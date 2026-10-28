@@ -109,8 +109,8 @@ struct HotspotsPage: View {
                                 Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(.secondary)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(peer.name).font(.headline)
-                                    if let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
-                                        Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary).help("Battery level last reported by Samsung; refreshed at most every five minutes.")
+                                    if let battery = model.batteryPercent(for: peer.address) {
+                                        DeviceBatteryBadge(percent: battery)
                                     }
                                     Text("No hotspot — this device declined the request. Retry is delayed; Wi-Fi-only models cannot tether.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 }
@@ -124,8 +124,8 @@ struct HotspotsPage: View {
                                 Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(OneUI.blue)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(peer.name).font(.headline)
-                                    if let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
-                                        Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary).help("Battery level last reported by Samsung; refreshed at most every five minutes.")
+                                    if let battery = model.batteryPercent(for: peer.address) {
+                                        DeviceBatteryBadge(percent: battery)
                                     }
                                     Text(statusText(for: peer)).font(.caption).foregroundStyle(.secondary)
                                         .fixedSize(horizontal: false, vertical: true)

@@ -139,7 +139,7 @@ struct ClipboardURI: Codable {
     func request(_ job: Job) {
         launch { [weak self] in
             guard let self else { return }
-            // Prefer the Wi-Fi command link when it comes up quickly. The phone
+            // Prefer the Wi-Fi command link when it comes up quickly. The device
             // also accepts the data-channel request over Bluetooth, and does
             // not always offer a handover, so its absence is not an error.
             if case .image = job, (try? await session?.waitForWifiCommand(attempts: 30)) == nil {
@@ -187,7 +187,7 @@ struct ClipboardURI: Codable {
             status?("Requested an authenticated clipboard Wi-Fi transfer (Mac networks: \(FeatureProtocol.networkSummary(networks))).")
             launch { [weak self] in
                 try await Task.sleep(nanoseconds: 20_000_000_000)
-                if self?.pending.removeValue(forKey: name) != nil { self?.status?("The phone did not open its clipboard data connection.") }
+                if self?.pending.removeValue(forKey: name) != nil { self?.status?("The device did not open its clipboard data connection.") }
             }
         } catch { pending.removeValue(forKey: name); throw error }
     }
@@ -200,9 +200,9 @@ struct ClipboardURI: Codable {
             status?("Clipboard data-channel response code: \(code).")
             if code != 1 {
                 pending.removeValue(forKey: name)
-                // Phone codes: 3 = no shared subnet, 4 = missing network info, 2 = other failure.
-                status?(code == 3 ? "The phone found no network shared with the Mac. Join the same Wi-Fi or the phone's hotspot for images."
-                                  : "The phone declined the clipboard data channel.")
+                // Device codes: 3 = no shared subnet, 4 = missing network info, 2 = other failure.
+                status?(code == 3 ? "The device found no network shared with the Mac. Join the same Wi-Fi or the device's hotspot for images."
+                                  : "The device declined the clipboard data channel.")
             }
             return
         }
@@ -220,10 +220,10 @@ struct ClipboardURI: Codable {
             if let reply { try await reply(100, response) }
             else { try await session.sendControl(handler: 100, command: response) }
             guard let job, let endpoint, approved else {
-                status?("Declined the phone's clipboard data-channel request (\(job == nil ? "nothing to send" : endpoint == nil ? "no shared network" : "busy")).")
+                status?("Declined the device's clipboard data-channel request (\(job == nil ? "nothing to send" : endpoint == nil ? "no shared network" : "busy")).")
                 return
             }
-            status?("Phone requested a clipboard data channel; connecting to it.")
+            status?("Device requested a clipboard data channel; connecting to it.")
             let transport = MCFTransport(host: endpoint.0, port: endpoint.1)
             let id = UUID(); sockets[id] = transport
             defer { transport.cancel(); sockets.removeValue(forKey: id) }
@@ -262,7 +262,7 @@ struct ClipboardURI: Codable {
         try await transport.send(auth.reply(to: transport.receive()))
         guard let name = auth.requestedChannel, let job = pending.removeValue(forKey: name) else { throw ContinuityError.message("Unrequested clipboard data connection.") }
         try auth.finish(await transport.receive())
-        status?("Phone opened an account-authenticated clipboard data socket.")
+        status?("Device opened an account-authenticated clipboard data socket.")
         guard let key = auth.sessionKey else { throw ContinuityError.message("No clipboard data session key.") }
         try await exchange(transport, key: key, job: job)
     }
@@ -286,7 +286,7 @@ struct ClipboardURI: Codable {
         case .image(let sequence): clipSequence = sequence; try await send(8, 1, Data([sequence]))
         case .metadata(let sequence, let size), .clipDownload(let sequence, let size): clipSequence = sequence; expected = size; uriList = false
         case .metadataUpload(_, let data): try await chunks(data)
-        case .rawUpload(_, let data): try await chunks(data); status?("Streamed the Mac image; waiting for phone confirmation.")
+        case .rawUpload(_, let data): try await chunks(data); status?("Streamed the Mac image; waiting for device confirmation.")
         case .upload: break
         }
         while !Task.isCancelled {
@@ -308,8 +308,8 @@ struct ClipboardURI: Codable {
                     if command.id == 3, command.type == 1 {
                         switch job {
                         case .upload(let sequence, _, _), .metadataUpload(let sequence, _), .rawUpload(let sequence, _):
-                            guard command.payload == Data([sequence, 1]) else { throw ContinuityError.message("The phone did not confirm a successful clipboard download.") }
-                            status?("Phone confirmed the clipboard transfer completed.")
+                            guard command.payload == Data([sequence, 1]) else { throw ContinuityError.message("The device did not confirm a successful clipboard download.") }
+                            status?("Device confirmed the clipboard transfer completed.")
                         default: break
                         }
                         try await send(3, 2, Data(command.payload.prefix(1))); return
@@ -318,14 +318,14 @@ struct ClipboardURI: Codable {
                     case .upload(let sequence, let data, let uri):
                         if command.id == 8, command.type == 1, command.payload == Data([sequence]) {
                             try await chunks(JSONEncoder().encode([ClipboardURI(relativePath: String(uri.split(separator: "/").last ?? "image.png"), uri: uri, size: data.count, isFolder: false)]))
-                            status?("Sent the clipboard file list to the phone.")
+                            status?("Sent the clipboard file list to the device.")
                             try await send(8, 2, Data([sequence, 0]))
                         } else if command.id == 5, command.type == 1 {
                             guard command.payload == Data(uri.utf8) else { throw ContinuityError.message("The peer requested a different clipboard URI.") }
                             try await send(5, 2, Data([16]) + ClipboardDataWire.size(data.count))
                             try await chunks(data)
                             try await send(5, 2, Data([0]) + ClipboardDataWire.size(0))
-                            status?("Transferred Mac clipboard image bytes; waiting for phone confirmation.")
+                            status?("Transferred Mac clipboard image bytes; waiting for device confirmation.")
                         }
                     case .image:
                         if command.id == 8, command.type == 2 {
@@ -346,7 +346,7 @@ struct ClipboardURI: Codable {
                             case 0:
                                 try await finishImage(); return
                             default:
-                                throw ContinuityError.message("The phone could not send the clipboard image (code \(code)).")
+                                throw ContinuityError.message("The device could not send the clipboard image (code \(code)).")
                             }
                         }
                     case .metadata, .metadataUpload, .rawUpload, .clipDownload: break

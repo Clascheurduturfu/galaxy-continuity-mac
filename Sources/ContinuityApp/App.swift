@@ -44,6 +44,8 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 }
 
+enum HotspotInformationQueryState { case checking, unanswered }
+
 @MainActor final class LabModel: ObservableObject {
     @Published var devices: [ContinuityDevice] = []
     @Published var nearbyPeers: [NearbyPeer] = []
@@ -123,6 +125,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     /// Devices that answered "no hotspot" are excluded from new queries.
     let hotspotCapability = HotspotCapabilityMemory()
     let wifiMenu = WiFiMenuHotspot()
+    @Published private(set) var hotspotInformationStates: [String: HotspotInformationQueryState] = [:]
     private var statusQueries: [String: Task<Void, Never>] = [:]
     private var statusQueryIDs: [String: UUID] = [:]
     private var hotspotLinkedAddresses = Set<String>()
@@ -136,19 +139,42 @@ enum SidebarSection: String, CaseIterable, Identifiable {
               statusRetryAfter[address, default: .distantPast] <= Date() else { return }
         statusRetryAfter[address] = Date().addingTimeInterval(300)
         let id = UUID(); statusQueryIDs[address] = id
+        hotspotInformationStates[address] = .checking
         statusQueries[address] = Task { [weak self, weak link] in
-            guard let self, let link else { return }
-            defer { if self.statusQueryIDs[address] == id { self.statusQueries[address] = nil; self.statusQueryIDs[address] = nil } }
+            guard let self else { return }
+            defer {
+                if self.statusQueryIDs[address] == id {
+                    if case .checking? = self.hotspotInformationStates[address] {
+                        self.hotspotInformationStates[address] = nil
+                    }
+                    self.statusQueries[address] = nil
+                    self.statusQueryIDs[address] = nil
+                    let currentLink = self.clipboardSession(for: address)
+                    if currentLink !== link {
+                        self.statusRetryAfter[address] = nil
+                        if let currentLink { self.refreshHotspotInformation(currentLink) }
+                    }
+                }
+            }
+            guard let link else { return }
             do {
                 let info = try await link.requestHotspotInformation()
                 guard self.statusQueryIDs[address] == id, self.clipboardSession(for: address) === link else { return }
                 self.hotspotCenter.storeInformation(address: address, value: info)
+                self.hotspotInformationStates[address] = nil
                 self.trace("Samsung status received: battery=\(info.batteryPercent.map(String.init) ?? "unknown")%.")
                 self.objectWillChange.send()
-            } catch { if !Task.isCancelled { self.trace("The device did not answer the non-activating hotspot status query; retry is delayed.") } }
+            } catch {
+                if !Task.isCancelled, self.statusQueryIDs[address] == id,
+                   self.clipboardSession(for: address) === link {
+                    self.hotspotInformationStates[address] = .unanswered
+                    self.trace("The device did not answer the non-activating hotspot status query; retry is delayed.")
+                }
+            }
         }
     }
     func retryHotspotInformation(for address: String) {
+        hotspotInformationStates[address] = nil
         statusQueryIDs[address] = nil
         statusQueries.removeValue(forKey: address)?.cancel()
         statusRetryAfter[address] = nil
@@ -344,6 +370,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 Task { @MainActor in
                     guard let self else { return }
                     self.trace("Mac woke from sleep; refreshing Galaxy continuity links.")
+                    self.hotspotInformationStates.removeAll()
                     self.statusQueryIDs.removeAll()
                     for task in self.statusQueries.values { task.cancel() }; self.statusQueries.removeAll()
                     self.statusRetryAfter.removeAll()
@@ -709,6 +736,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     func updateNearbyConnections() {
         let live = Set(clipboardSessions.compactMap(\.peerAddress))
         for address in hotspotLinkedAddresses.subtracting(live) {
+            hotspotInformationStates[address] = nil
             statusQueryIDs[address] = nil
             statusQueries.removeValue(forKey: address)?.cancel()
             statusRetryAfter[address] = nil

@@ -1,6 +1,6 @@
 # Auto Hotspot: native macOS Wi-Fi menu integration
 
-Status: Beta 3 repair, 2026-10-28. The private research checkout retains both
+Status: Beta 4, 2026-10-28 (Beta 3 repairs plus hotspot-query UI correction). The private research checkout retains both
 `AUTO_HOTSPOT_RESEARCH.md` and the original v4 Objective-C source. They were
 not lost; temporary copies disappearing from `/tmp` did not remove these files.
 
@@ -102,6 +102,10 @@ immediately downgrades a connectable peer on that one frame. Updating the same
 account profile also no longer erases all proximity observations. Home's
 phone preference is separate from per-device service/clipboard routing;
 automatic fallback does not silently replace the saved preferred peer.
+
+Hotspot cards show “checking” only while a query is in flight. A timed-out
+query becomes “no hotspot status reply”; it never implies an ongoing check
+or permanent hardware incompatibility. This UI correction is visible in Beta 4.
 
 ## Validation log
 

@@ -90,6 +90,14 @@ struct HotspotsPage: View {
     @ObservedObject var model: LabModel
     @ObservedObject var hotspots: HotspotsModel
     private var peers: [NearbyPeer] { model.nearbyPeers.filter { $0.nearby && ["phone", "tablet", "tab"].contains($0.deviceType?.lowercased() ?? "") } }
+    private func statusText(for peer: NearbyPeer) -> String {
+        if model.hotspotCenter.information(address: peer.address) != nil { return "Nearby · hotspot service available" }
+        switch model.hotspotInformationStates[peer.address] {
+        case .checking?: return "Nearby · checking hotspot availability…"
+        case .unanswered?: return "Nearby · no hotspot status reply"
+        case nil: return "Nearby · hotspot availability not confirmed"
+        }
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -119,7 +127,9 @@ struct HotspotsPage: View {
                                     if let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
                                         Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary).help("Battery level last reported by Samsung; refreshed at most every five minutes.")
                                     }
-                                    Text(model.hotspotCenter.information(address: peer.address) == nil ? "Nearby · checking hotspot availability" : "Nearby · hotspot service available").font(.caption).foregroundStyle(.secondary)
+                                    Text(statusText(for: peer)).font(.caption).foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .help("A missing reply can mean Auto Hotspot is off or unsupported on this device. It is not a permanent hardware verdict.")
                                 }
                                 Spacer()
                                 Button(hotspots.busy && hotspots.target == peer.address ? "Connecting…" : "Connect") {

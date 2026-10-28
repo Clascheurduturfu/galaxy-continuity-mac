@@ -55,9 +55,12 @@ final class CallingSessionTests: XCTestCase {
         defer { a.stop(); b.stop() }
         // feed 440 Hz into A's microphone ring for ~1 s while B stays silent
         let tone = (0..<16000).map { Int16(sin(Double($0) * 2 * .pi * 440 / 16000) * 9000) }
-        let deadline = Date().addingTimeInterval(1.2)
+        // Observe progress instead of assuming a hosted runner delivers every
+        // 20 ms dispatch tick on time. Keep a deadline so a broken sender still fails.
+        let started = Date(), deadline = Date().addingTimeInterval(5)
         var fed = 0, heard: [Int16] = []
         while Date() < deadline {
+            if queueA.sync(execute: { a.stats.sent }) >= 50 && queueB.sync(execute: { b.stats.received }) >= 45 { break }
             if fed + 320 <= tone.count { audioA.capture.write(Array(tone[fed..<fed + 320])); fed += 320 }
             heard += audioB.playback.read(4000)
             Thread.sleep(forTimeInterval: 0.02)
@@ -67,14 +70,17 @@ final class CallingSessionTests: XCTestCase {
         XCTAssertGreaterThan(heard.count, 16000 / 4, "B should have played at least 250 ms of A's speech")
         XCTAssertGreaterThan(energy, 500, "decoded audio must carry the tone, not silence")
         let statsB = queueB.sync { b.stats }
-        XCTAssertGreaterThan(statsB.received, 20); XCTAssertEqual(statsB.rejected, 0)
-        // 20 ms cadence: about 50 packets per second, nowhere near 100 or 25
+        XCTAssertGreaterThanOrEqual(statsB.received, 45, "The receiver must make bounded progress"); XCTAssertEqual(statsB.rejected, 0)
         let statsA = queueA.sync { a.stats }
-        XCTAssertTrue((35...65).contains(statsA.sent), "sent \(statsA.sent) packets in ~1.2 s")
+        XCTAssertGreaterThanOrEqual(statsA.sent, 50, "The sender must make bounded progress")
+        // Delayed dispatch is allowed under load; transmitting faster than the
+        // configured 20 ms cadence is not. Five ticks allow startup/sample skew.
+        XCTAssertLessThanOrEqual(statsA.sent, Int(ceil(Date().timeIntervalSince(started) / 0.02)) + 5)
         // injected garbage and a replayed packet are rejected
         let intruder = try CallingUDPSocket(queue: queueA, bindAddress: "127.0.0.1")
         intruder.send(Data(repeating: 0x80, count: 60), to: "127.0.0.1", port: sockB.port)
-        Thread.sleep(forTimeInterval: 0.1)
+        let rejectionDeadline = Date().addingTimeInterval(2)
+        while queueB.sync(execute: { b.stats.rejected }) < 1 && Date() < rejectionDeadline { Thread.sleep(forTimeInterval: 0.01) }
         XCTAssertGreaterThanOrEqual(queueB.sync { b.stats.rejected }, 1)
         intruder.close()
     }

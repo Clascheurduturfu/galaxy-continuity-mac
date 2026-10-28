@@ -39,7 +39,7 @@ import ContinuityCore
                     do {
                         guard credentials.isSuccess == true else {
                             self.capability?.markUnavailable(peer.address, reason: credentials.mhsfailed_reason)
-                            throw ContinuityError.message("This device declined the hotspot request (reason \(credentials.mhsfailed_reason ?? -1)). It is excluded for 24 h; retry from this page.")
+                            throw ContinuityError.message("This device declined the hotspot request (reason \(credentials.mhsfailed_reason ?? -1)). Retry from this page when the device is ready.")
                         }
                         self.center?.store(address: peer.address, credentials: credentials)
                         self.capability?.markAvailable(peer.address)
@@ -101,10 +101,13 @@ struct HotspotsPage: View {
                                 Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(.secondary)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(peer.name).font(.headline)
-                                    Text("No hotspot — this device declined the request. Excluded for 24 h; Wi-Fi-only models cannot tether.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    if let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
+                                        Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary).help("Battery level last reported by Samsung; refreshed at most every five minutes.")
+                                    }
+                                    Text("No hotspot — this device declined the request. Retry is delayed; Wi-Fi-only models cannot tether.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                                 }
                                 Spacer()
-                                Button("Retry") { hotspots.retry(peer: peer) }.buttonStyle(OneUISecondaryButtonStyle())
+                                Button("Retry") { hotspots.retry(peer: peer); model.retryHotspotInformation(for: peer.address) }.buttonStyle(OneUISecondaryButtonStyle())
                             }
                         }
                     } else {
@@ -113,12 +116,15 @@ struct HotspotsPage: View {
                                 Image(systemName: "personalhotspot").font(.system(size: 26)).foregroundStyle(OneUI.blue)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(peer.name).font(.headline)
-                                    Text("Nearby · hotspot availability checked when requested").font(.caption).foregroundStyle(.secondary)
+                                    if let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
+                                        Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary).help("Battery level last reported by Samsung; refreshed at most every five minutes.")
+                                    }
+                                    Text(model.hotspotCenter.information(address: peer.address) == nil ? "Nearby · checking hotspot availability" : "Nearby · hotspot service available").font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 Button(hotspots.busy && hotspots.target == peer.address ? "Connecting…" : "Connect") {
                                     if let profile = model.profile {
-                                        let existing = model.connected && model.selectedTarget == peer.address ? model.session : nil
+                                        let existing = model.clipboardSession(for: peer.address)
                                         hotspots.center = model.hotspotCenter
                                         hotspots.capability = model.hotspotCapability
                                         hotspots.join(profile: profile, peer: peer, existing: existing)
@@ -136,11 +142,11 @@ struct HotspotsPage: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(hotspots.status).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         if hotspots.busy { Button("Cancel Request") { hotspots.cancel() } }
-                        Text("Samsung enables the hotspot after account authentication. macOS needs Location Services to find and join its Wi-Fi. Queries run only on demand, answers are cached 20 s, and devices that decline are remembered.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Text("Samsung enables the hotspot after account authentication. macOS needs Location Services to find and join its Wi-Fi. Status is checked once per connection and cached for five minutes; activation only happens when you choose Connect.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
             }.padding(28)
-        }
+        }.onAppear { model.refreshHotspotInformation() }
     }
 }

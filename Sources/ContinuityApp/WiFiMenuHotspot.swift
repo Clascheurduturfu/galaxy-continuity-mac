@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ContinuityCore
+import Darwin
 
 /// Native macOS Wi-Fi menu integration (experimental; requires SIP disabled).
 ///
@@ -18,14 +19,14 @@ import ContinuityCore
 /// - `trigger`      hook → app: the entry was clicked → answer with creds.json
 /// - `creds.json`   app → hook: {isSuccess, ssid, password, reason}
 @MainActor final class WiFiMenuHotspot: ObservableObject {
-    static let directory = URL(fileURLWithPath: "/tmp/gcl-wifi-menu")
-    static let statusFile = WiFiMenuHotspot.directory.appendingPathComponent("status.json")
-    static let availableFile = WiFiMenuHotspot.directory.appendingPathComponent("available")
-    static let menuOpenedFile = WiFiMenuHotspot.directory.appendingPathComponent("menu_opened")
-    static let triggerFile = WiFiMenuHotspot.directory.appendingPathComponent("trigger")
-    static let credsFile = WiFiMenuHotspot.directory.appendingPathComponent("creds.json")
+    nonisolated static let directory = URL(fileURLWithPath: "/tmp/gcl-wifi-menu")
+    nonisolated static let statusFile = WiFiMenuHotspot.directory.appendingPathComponent("status.json")
+    nonisolated static let availableFile = WiFiMenuHotspot.directory.appendingPathComponent("available")
+    nonisolated static let menuOpenedFile = WiFiMenuHotspot.directory.appendingPathComponent("menu_opened")
+    nonisolated static let triggerFile = WiFiMenuHotspot.directory.appendingPathComponent("trigger")
+    nonisolated static let credsFile = WiFiMenuHotspot.directory.appendingPathComponent("creds.json")
 
-    @Published var enabled = UserDefaults.standard.bool(forKey: "hotspot.wifiMenu.enabled") {
+    @Published var enabled = false {
         didSet {
             UserDefaults.standard.set(enabled, forKey: "hotspot.wifiMenu.enabled")
             if !internalChange { applyEnabled() }
@@ -38,11 +39,34 @@ import ContinuityCore
     @Published var status = "Not set up."
     private var loop: Task<Void, Never>?
     private var handling = false
+    @Published private(set) var installing = false
+    private var installation: Task<Void, Never>?
     /// Wired by LabModel: the live session and the device it targets.
     var liveSession: (() -> (session: ClipboardSession, address: String, name: String)?)?
     var center: HotspotCenter?
     var capability: HotspotCapabilityMemory?
     var note: ((String) -> Void)?
+
+    func start() {
+        guard !AppVersion.isRenderingDemo else { return }
+        let wasEnabled = UserDefaults.standard.bool(forKey: "hotspot.wifiMenu.enabled")
+        let isScoped = UserDefaults.standard.string(forKey: "hotspot.wifiMenu.loader") == "scoped-v1"
+        if isScoped && wasEnabled {
+            enabled = true
+        } else {
+            UserDefaults.standard.set(false, forKey: "hotspot.wifiMenu.enabled")
+            installing = true
+            installation = Task { [weak self] in
+                let restored = await Task.detached {
+                    let hadLegacy = Self.clearLegacyGlobalInjection()
+                    return Self.restoreTargets(force: hadLegacy || (wasEnabled && !isScoped))
+                }.value
+                guard let self else { return }
+                self.installing = false; self.installation = nil
+                self.status = restored ? "Off. Legacy menu injection has been removed." : "Legacy injection was disabled, but the menu agents could not restart. Log out and back in to restore them."
+            }
+        }
+    }
 
     // MARK: SIP
 
@@ -59,27 +83,44 @@ import ContinuityCore
     // MARK: enable / disable
 
     private func applyEnabled() {
+        guard !installing else { return }
         loop?.cancel(); loop = nil
-        guard enabled else {
-            removeFile(Self.availableFile); removeFile(Self.menuOpenedFile); removeFile(Self.triggerFile)
-            Self.launchctl(["unsetenv", "DYLD_INSERT_LIBRARIES"])
-            Self.restartTargets()
-            status = "Off. The Wi-Fi menu is back to stock after the menu apps restart."
-            return
+        let requested = enabled
+        if !requested {
+            removeFile(Self.availableFile); removeFile(Self.menuOpenedFile); removeFile(Self.triggerFile); removeFile(Self.credsFile)
+        } else {
+            refreshSIP()
+            guard sipDisabled == true else { disableInternally("System Integrity Protection blocks this experimental integration."); return }
         }
-        refreshSIP()
-        guard sipDisabled == true else { disableInternally("System Integrity Protection is enabled, so macOS blocks the Wi-Fi menu hook. Disable SIP (csrutil disable in Recovery) to use this."); return }
-        guard let dylib = Self.installedHookPath() else { disableInternally("The Wi-Fi menu hook is missing from this build. Update the app and try again."); return }
-        try? FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-        Self.launchctl(["setenv", "DYLD_INSERT_LIBRARIES", dylib.path])
-        Self.restartTargets()
-        status = "Hook injected into the Wi-Fi menu apps. The entry appears once a Galaxy session is live."
-        loop = Task { [weak self] in
-            var tick = 0
-            while !Task.isCancelled {
-                await self?.poll(tick: tick)
-                tick += 1
-                try? await Task.sleep(nanoseconds: 500_000_000)
+        guard !requested || Bundle.main.url(forResource: "GalaxyContinuityWiFiMenuHook", withExtension: "dylib") != nil else {
+            disableInternally("The Wi-Fi menu hook is missing from this build."); return
+        }
+        installing = true; status = requested ? "Starting Wi-Fi menu integration…" : "Restoring the Wi-Fi menu…"
+        installation = Task { [weak self] in
+            let failure = await Task.detached(priority: .userInitiated) { () -> String? in
+                Self.clearLegacyGlobalInjection()
+                guard requested else { return Self.restoreTargets() ? nil : "The stock menu agents could not restart. Log out and back in to restore them." }
+                do {
+                    guard let dylib = Self.installedHookPath() else { throw ContinuityError.message("Could not copy the bundled hook.") }
+                    try Self.prepareIPC()
+                    try Self.installScopedTargets(dylib)
+                    return nil
+                } catch {
+                    let restored = Self.restoreTargets()
+                    return error.localizedDescription + (restored ? " Stock agents restored." : " Log out and back in to restore the menu agents.")
+                }
+            }.value
+            guard let self else { return }
+            self.installing = false; self.installation = nil
+            if let failure { self.disableInternally("Wi-Fi menu integration is off. " + failure); return }
+            guard requested else { self.status = "Off. The stock Wi-Fi menu has been restored."; return }
+            self.status = "Wi-Fi menu integration active."
+            self.loop = Task { [weak self] in
+                var tick = 0
+                while !Task.isCancelled {
+                    await self?.poll(tick: tick); tick += 1
+                    do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                }
             }
         }
     }
@@ -103,17 +144,16 @@ import ContinuityCore
     private func publishAvailability(tick: Int) {
         guard tick % 10 == 0 else { return }
         guard let capability else { return }
-        guard let live = liveSession?(), !capability.unavailable(live.address) else {
+        guard let live = liveSession?(), center?.information(address: live.address) != nil, !capability.unavailable(live.address) else {
             removeFile(Self.availableFile)
-            if tick % 20 == 0 { center?.invalidate() }   // no session: drop cached answers
             return
         }
         let payload: [String: Any] = [
-            "name": live.name, "battery": 88, "bars": 4, "network": "5G",
+            "name": live.name, "battery": center?.information(address: live.address)?.batteryPercent ?? -1,
             "ssid": center?.cached(address: live.address)?.ssid ?? ""
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.statusFile, options: .atomic) }
-        FileManager.default.createFile(atPath: Self.availableFile.path, contents: nil, attributes: [.modificationDate: Date()])
+        if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.statusFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statusFile.path) }
+        FileManager.default.createFile(atPath: Self.availableFile.path, contents: nil, attributes: [.modificationDate: Date(), .posixPermissions: 0o600])
     }
 
     // MARK: queries (on demand only, cached, existing session only)
@@ -123,11 +163,11 @@ import ContinuityCore
     /// wake/disconnect invalidated it.
     private func prefetch() async {
         guard let live = liveSession?(), let center, let capability else { return }
-        guard center.cached(address: live.address) == nil, !capability.unavailable(live.address) else { return }
+        guard center.information(address: live.address) == nil, !capability.unavailable(live.address) else { return }
         do {
-            let answer = try await live.session.requestHotspotAnswer(timeout: 15)
-            center.store(address: live.address, credentials: answer)
-            if answer.isSuccess == true { capability.markAvailable(live.address) } else { capability.markUnavailable(live.address, reason: answer.mhsfailed_reason) }
+            let info = try await live.session.requestHotspotInformation(timeout: 10)
+            center.storeInformation(address: live.address, value: info)
+            capability.markAvailable(live.address)
             note?("Wi-Fi menu opened: refreshed the hotspot answer from \(live.name).")
         } catch { note?("Wi-Fi menu prefetch: \(error.localizedDescription)") }
     }
@@ -151,17 +191,33 @@ import ContinuityCore
             "password": answer?.password ?? "",
             "reason": answer?.mhsfailed_reason ?? reason
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.credsFile, options: .atomic) }
+        if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.credsFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.credsFile.path) }
     }
     /// Wake, disconnect or user action: the next query re-asks the phone.
     func invalidateCache() { center?.invalidate() }
 
     // MARK: injection plumbing
 
-    static func installedHookPath() -> URL? {
+    private nonisolated static func prepareIPC() throws {
+        var info = stat()
+        if lstat(directory.path, &info) != 0 {
+            guard errno == ENOENT, mkdir(directory.path, 0o700) == 0, lstat(directory.path, &info) == 0 else { throw ContinuityError.message("Could not create private Wi-Fi menu storage.") }
+        }
+        guard (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == getuid(), chmod(directory.path, 0o700) == 0 else {
+            throw ContinuityError.message("Wi-Fi menu storage is not an owned directory.")
+        }
+        for name in ["status.json", "available", "menu_opened", "trigger", "creds.json", "hook.log"] {
+            let path = directory.appendingPathComponent(name).path
+            if lstat(path, &info) == 0 {
+                guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1 else { throw ContinuityError.message("Unexpected Wi-Fi menu storage entry.") }
+                _ = chmod(path, 0o600)
+            }
+        }
+    }
+    nonisolated static func installedHookPath() -> URL? {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Galaxy Continuity Lab/GalaxyContinuityWiFiMenuHook.dylib", isDirectory: false)
-        if FileManager.default.fileExists(atPath: support.path) { return support }
+        // Always refresh the copied library; an older cached copy can have the wrong ABI.
         guard let bundled = Bundle.main.url(forResource: "GalaxyContinuityWiFiMenuHook", withExtension: "dylib") else { return nil }
         do {
             try FileManager.default.createDirectory(at: support.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -170,19 +226,92 @@ import ContinuityCore
             return support
         } catch { return nil }
     }
-    private static func launchctl(_ arguments: [String]) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl"); process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-        try? process.run()
+    private nonisolated static let jobs = ["com.apple.wifi.WiFiAgent", "com.apple.controlcenter"]
+    private nonisolated static var jobDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Galaxy Continuity Lab/HookLaunchAgents", isDirectory: true)
     }
-    /// Relaunch the menu-owning processes so they pick up (or drop) the hook.
-    private static func restartTargets() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        process.arguments = ["WiFiAgent", "ControlCenter"]
-        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-        try? process.run()
+    @discardableResult private nonisolated static func run(_ executable: String, _ args: [String]) -> (Int32, String) {
+        let process = Process(), pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable); process.arguments = args
+        process.standardOutput = pipe; process.standardError = pipe
+        do { try process.run() } catch { return (-1, "Could not run system helper.") }
+        // launchctl can wait indefinitely for a crashed process; never hang the app UI.
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if process.isRunning { process.terminate(); return (-1, "System helper timed out.") }
+        let bytes = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(decoding: bytes.prefix(32768), as: UTF8.self))
+    }
+    @discardableResult private nonisolated static func clearLegacyGlobalInjection() -> Bool {
+        let old = run("/bin/launchctl", ["getenv", "DYLD_INSERT_LIBRARIES"]).1.trimmingCharacters(in: .whitespacesAndNewlines)
+        if old.contains("GalaxyContinuityWiFiMenuHook") {
+            _ = run("/bin/launchctl", ["unsetenv", "DYLD_INSERT_LIBRARIES"])
+            return true
+        }
+        return false
+    }
+    private nonisolated static func installScopedTargets(_ dylib: URL) throws {
+        #if arch(arm64)
+        let required = "arm64e"
+        #else
+        let required = "x86_64"
+        #endif
+        guard run("/usr/bin/lipo", ["-verify_arch", required, dylib.path]).0 == 0 else {
+            throw ContinuityError.message("The bundled hook lacks the system process architecture (" + required + ").")
+        }
+        try FileManager.default.createDirectory(at: jobDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data().write(to: directory.appendingPathComponent("hook.log"), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: directory.appendingPathComponent("hook.log").path)
+        let domain = "gui/" + String(getuid())
+        for job in jobs {
+            let original = URL(fileURLWithPath: "/System/Library/LaunchAgents/" + job + ".plist")
+            guard var plist = try PropertyListSerialization.propertyList(from: Data(contentsOf: original), format: nil) as? [String: Any] else {
+                throw ContinuityError.message("Could not read the stock menu launch agent.")
+            }
+            var environment = plist["EnvironmentVariables"] as? [String: String] ?? [:]
+            environment["DYLD_INSERT_LIBRARIES"] = dylib.path
+            plist["EnvironmentVariables"] = environment
+            let local = jobDirectory.appendingPathComponent(job + ".plist")
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0).write(to: local, options: .atomic)
+            _ = run("/bin/launchctl", ["bootout", domain + "/" + job])
+            Thread.sleep(forTimeInterval: 0.5)
+            guard bootstrap(domain: domain, path: local.path) else {
+                _ = bootstrap(domain: domain, path: original.path)
+                throw ContinuityError.message("The menu agent rejected the scoped loader.")
+            }
+        }
+        Thread.sleep(forTimeInterval: 1)
+        for job in jobs {
+            let result = run("/bin/launchctl", ["print", domain + "/" + job])
+            guard result.0 == 0, result.1.contains("state = running"), result.1.contains("pid = ") else {
+                throw ContinuityError.message("A menu agent failed its startup check.")
+            }
+        }
+        let log = (try? String(contentsOf: directory.appendingPathComponent("hook.log"), encoding: .utf8)) ?? ""
+        guard log.contains("[WiFiAgent] hook install complete"), log.contains("[ControlCenter] hook install complete") else {
+            throw ContinuityError.message("The menu agents did not confirm loading the hook.")
+        }
+        UserDefaults.standard.set("scoped-v1", forKey: "hotspot.wifiMenu.loader")
+    }
+    private nonisolated static func bootstrap(domain: String, path: String) -> Bool {
+        for _ in 0..<4 {
+            if run("/bin/launchctl", ["bootstrap", domain, path]).0 == 0 { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return false
+    }
+    @discardableResult private nonisolated static func restoreTargets(force: Bool = false) -> Bool {
+        var restored = true
+        let domain = "gui/" + String(getuid())
+        for job in jobs {
+            let loaded = run("/bin/launchctl", ["print", domain + "/" + job]).1
+            guard force || loaded.contains(jobDirectory.path) else { continue }
+            _ = run("/bin/launchctl", ["bootout", domain + "/" + job])
+            Thread.sleep(forTimeInterval: 0.5)
+            if !bootstrap(domain: domain, path: "/System/Library/LaunchAgents/" + job + ".plist") { restored = false }
+        }
+        return restored
     }
     private func removeFile(_ url: URL) { try? FileManager.default.removeItem(at: url) }
 }
@@ -193,10 +322,10 @@ struct WiFiMenuHotspotCard: View {
         OneUICard {
             VStack(alignment: .leading, spacing: 12) {
                 Label("macOS Wi-Fi menu", systemImage: "wifi").font(.headline)
-                Text("Show the connected Galaxy as a native Personal Hotspot in the macOS Wi-Fi menu. Experimental: needs SIP disabled and restarts the menu apps once. Queries only on demand, cached 20 s, and only while the phone session is live.")
+                Text("Show the connected Galaxy as a native Personal Hotspot in the macOS Wi-Fi menu. Experimental: needs SIP disabled and restarts the menu apps once. Status checks do not enable tethering. Only the two Wi-Fi menu agents are injected, while a Galaxy session is live.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack {
-                    Toggle("Integrate with the Wi-Fi menu", isOn: $wifiMenu.enabled).toggleStyle(OneUIAlignedSwitchStyle())
+                    Toggle("Integrate with the Wi-Fi menu", isOn: $wifiMenu.enabled).toggleStyle(OneUIAlignedSwitchStyle()).disabled(wifiMenu.installing)
                     Spacer()
                     Button("Check SIP") { wifiMenu.refreshSIP() }.buttonStyle(OneUISecondaryButtonStyle())
                 }

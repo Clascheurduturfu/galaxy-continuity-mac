@@ -53,6 +53,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     @Published var hasNativeSignIn = false
     @Published var accountEmail = ""
     private var started = false
+    private var bluetoothDiagnostic: BluetoothDiscovery?
     @Published var profile: ContinuityProfile?
     @Published var pending: Data?
     @Published var code = ""
@@ -122,6 +123,45 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     /// Devices that answered "no hotspot" are excluded from new queries.
     let hotspotCapability = HotspotCapabilityMemory()
     let wifiMenu = WiFiMenuHotspot()
+    private var statusQueries: [String: Task<Void, Never>] = [:]
+    private var statusQueryIDs: [String: UUID] = [:]
+    private var hotspotLinkedAddresses = Set<String>()
+    private var statusRetryAfter: [String: Date] = [:]
+    func refreshHotspotInformation() {
+        for link in clipboardSessions { refreshHotspotInformation(link) }
+    }
+    private func refreshHotspotInformation(_ link: ClipboardSession) {
+        guard let address = link.peerAddress, statusQueries[address] == nil,
+              hotspotCenter.information(address: address) == nil,
+              statusRetryAfter[address, default: .distantPast] <= Date() else { return }
+        statusRetryAfter[address] = Date().addingTimeInterval(300)
+        let id = UUID(); statusQueryIDs[address] = id
+        statusQueries[address] = Task { [weak self, weak link] in
+            guard let self, let link else { return }
+            defer { if self.statusQueryIDs[address] == id { self.statusQueries[address] = nil; self.statusQueryIDs[address] = nil } }
+            do {
+                let info = try await link.requestHotspotInformation()
+                guard self.statusQueryIDs[address] == id, self.clipboardSession(for: address) === link else { return }
+                self.hotspotCenter.storeInformation(address: address, value: info)
+                self.trace("Samsung status received: battery=\(info.batteryPercent.map(String.init) ?? "unknown")%.")
+                self.objectWillChange.send()
+            } catch { if !Task.isCancelled { self.trace("The device did not answer the non-activating hotspot status query; retry is delayed.") } }
+        }
+    }
+    func retryHotspotInformation(for address: String) {
+        statusQueryIDs[address] = nil
+        statusQueries.removeValue(forKey: address)?.cancel()
+        statusRetryAfter[address] = nil
+        hotspotCapability.markAvailable(address)
+        hotspotCenter.invalidate(address: address)
+        if let link = clipboardSession(for: address) { refreshHotspotInformation(link) }
+    }
+    var homePeer: ContinuityProfile.Peer? {
+        guard let peers = profile?.peers else { return nil }
+        return GalaxyPeerPreference.home(peers: peers, connected: clipboardSessions.compactMap(\.peerAddress), nearby: nearbyPeers.filter(\.nearby).map(\.address), selected: selectedTarget)
+    }
+    var homeConnected: Bool { homePeer.flatMap { clipboardSession(for: $0.address) } != nil }
+
     let discovery = ContinuityDiscovery()
     private static let backoffSchedule = [2, 5, 10, 20, 45, 60]
 
@@ -168,6 +208,21 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     func start() {
         guard !started else { return }; started = true
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        let arguments = CommandLine.arguments
+        if let index = arguments.firstIndex(of: "--ble-capture"), index + 1 < arguments.count {
+            // Explicit diagnostic mode: a bounded passive snapshot, separate from normal logging.
+            let capture = BluetoothDiscovery(); bluetoothDiagnostic = capture
+            let output = URL(fileURLWithPath: arguments[index + 1])
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                capture.stop()
+                if let data = try? JSONSerialization.data(withJSONObject: Array(capture.samsungFrames.prefix(128))) {
+                    try? data.write(to: output, options: .atomic)
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
+                }
+                self?.bluetoothDiagnostic = nil
+            }
+        }
         hotspotJoiner.progress = { [weak self] in self?.note($0) }
         discovery.changed = { [weak self] devices in
             guard let self else { return }; self.devices = devices
@@ -195,16 +250,22 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             link.trace = { [weak self] in self?.trace($0) }
             self.receiveClipboard(from: link, name: name)
         }
-        nearbyClipboard.changed = { [weak self] in self?.updateNearbyConnections() }
+        nearbyClipboard.changed = { [weak self] in self?.updateNearbyConnections(); self?.refreshHotspotInformation() }
         nearbyClipboard.status = { [weak self] in self?.trace($0) }
         wifiMenu.center = hotspotCenter
         wifiMenu.capability = hotspotCapability
         wifiMenu.note = { [weak self] in self?.note($0) }
         wifiMenu.liveSession = { [weak self] in
-            guard let self, self.connected, let session = self.session, !self.selectedTarget.isEmpty else { return nil }
-            return (session, self.selectedTarget, self.targetDisplayName)
+            guard let self else { return nil }
+            let peers = (self.profile?.peers ?? []).sorted { ($0.deviceType == "phone" ? 0 : 1) < ($1.deviceType == "phone" ? 0 : 1) }
+            for peer in peers {
+                if let session = self.clipboardSession(for: peer.address), self.hotspotCenter.information(address: peer.address) != nil, !self.hotspotCapability.unavailable(peer.address) {
+                    return (session, peer.address, peer.name)
+                }
+            }
+            return nil
         }
-        if wifiMenu.enabled { wifiMenu.refreshSIP() }
+        wifiMenu.start()
         installSystemObservers()
 
         let args = CommandLine.arguments
@@ -281,8 +342,11 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 Task { @MainActor in
                     guard let self else { return }
                     self.trace("Mac woke from sleep; refreshing Galaxy continuity links.")
-                    self.hotspotCenter.invalidate()   // re-ask the phone after wake
+                    self.statusQueryIDs.removeAll()
+                    for task in self.statusQueries.values { task.cancel() }; self.statusQueries.removeAll()
+                    self.statusRetryAfter.removeAll()
                     self.wifiMenu.invalidateCache()
+                    self.refreshHotspotInformation()
                     self.reconnectAttempt = 0
                     self.lanPresence?.connectPCs()
                     if self.autoConnect, !self.userPaused, !self.connected, !self.busy {
@@ -415,9 +479,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         do {
             if !selectedTarget.isEmpty {
                 profile.preferredPeerAddress = selectedTarget
-                UserDefaults.standard.set(selectedTarget, forKey: "continuity.preferredPeerAddress")
-                try ProfileStore.save(profile)
-                self.profile = profile
+                // Automatic fallback is temporary; explicit selection is saved by selectPeerAndConnect.
             }
             let transport = try BLEMCFTransport(profile: profile)
             transport.status = { [weak self] in self?.note($0) }
@@ -502,7 +564,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
             guard value.isSuccess == true else {
                 self.joiningHotspot = false; self.hotspotBusy = false
                 if !address.isEmpty { self.hotspotCapability.markUnavailable(address, reason: value.mhsfailed_reason) }
-                self.note("The phone rejected Auto Hotspot (reason \(value.mhsfailed_reason ?? -1)). It is excluded from hotspot requests for 24 h (retry from the Auto Hotspot page).")
+                self.note("The phone rejected Auto Hotspot (reason \(value.mhsfailed_reason ?? -1)). Automatic retries pause briefly; use Retry on the Auto Hotspot page after checking its setting.")
                 return
             }
             if !address.isEmpty {
@@ -539,6 +601,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
                 reconnectAttempt = 0
                 reconnectSecondsRemaining = 0
                 updateNearbyConnections()
+                refreshHotspotInformation(session)
                 if CommandLine.arguments.contains("--clipboard-feature-test"), let profile {
                     let feature = FeatureSession(appID: 10); diagnosticFeature = feature
                     feature.status = { self.trace("Command-path probe: " + $0) }
@@ -642,6 +705,14 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 
     func updateNearbyConnections() {
+        let live = Set(clipboardSessions.compactMap(\.peerAddress))
+        for address in hotspotLinkedAddresses.subtracting(live) {
+            statusQueryIDs[address] = nil
+            statusQueries.removeValue(forKey: address)?.cancel()
+            statusRetryAfter[address] = nil
+            hotspotCenter.invalidate(address: address)
+        }
+        hotspotLinkedAddresses = live
         var addresses = lanPresence?.connectedPeers ?? []
         if connected, let address = session?.peerAddress { addresses.append(address) }
         addresses += nearbyClipboard.sessions.compactMap(\.peerAddress)
@@ -1011,7 +1082,7 @@ struct HomePageView: View {
 
     private var statusText: String {
         switch model.visualState {
-        case .connected(let name): return "Connected · \(name)"
+        case .connected: return model.homeConnected ? "Connected · \(model.homePeer?.name ?? "Galaxy phone")" : "Galaxy connections active"
         case .connecting: return "Connecting…"
         case .reconnecting(_, let s): return "Reconnecting in \(s)s"
         case .searching: return "Searching Nearby"
@@ -1049,16 +1120,16 @@ private struct HeroDeviceCard: View {
                                 )
                             )
                             .frame(width: 66, height: 66)
-                        Image(systemName: "iphone.gen3")
+                        Image(systemName: model.homePeer?.deviceType?.lowercased() == "phone" ? "iphone.gen3" : "ipad")
                             .font(.system(size: 30, weight: .semibold))
                             .foregroundStyle(model.connected ? Color.white : Color.primary)
                     }
 
                     VStack(alignment: .leading, spacing: 5) {
                         HStack(spacing: 8) {
-                            Text(model.profile == nil ? "Welcome to Galaxy Continuity" : model.targetDisplayName)
+                            Text(model.profile == nil ? "Welcome to Galaxy Continuity" : (model.homePeer?.name ?? "Galaxy Phone"))
                                 .font(.system(size: 22, weight: .bold, design: .rounded))
-                            if let modelCode = model.targetModelName, !modelCode.isEmpty {
+                            if let modelCode = model.homePeer?.model, !modelCode.isEmpty {
                                 Text(modelCode)
                                     .font(.system(size: 11, weight: .semibold))
                                     .foregroundStyle(.secondary)
@@ -1067,15 +1138,18 @@ private struct HeroDeviceCard: View {
                                     .background(Capsule().fill(Color.primary.opacity(0.07)))
                             }
                         }
-                        Text(subtitleText)
+                        if let peer = model.homePeer, let battery = model.hotspotCenter.information(address: peer.address)?.batteryPercent {
+                            Label("\(battery)%", systemImage: "battery.100").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(model.homeConnected ? "Authenticated clipboard session active with this device." : (model.connected ? "This phone is not connected. Other Galaxy device connections remain active." : subtitleText))
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
 
                         HStack(spacing: 8) {
                             OneUIStatusPill(
-                                model.connected ? "Bluetooth" : (model.autoConnect ? "Smart Auto-Connect" : "Manual Mode"),
-                                tone: model.connected ? .connected : .active,
+                                model.homeConnected ? "Bluetooth" : (model.autoConnect ? "Smart Auto-Connect" : "Manual Mode"),
+                                tone: model.homeConnected ? .connected : .active,
                                 symbol: "antenna.radiowaves.left.and.right"
                             )
                             if !model.lanPeers.isEmpty {

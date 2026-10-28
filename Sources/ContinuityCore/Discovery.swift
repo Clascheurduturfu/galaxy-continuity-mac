@@ -26,7 +26,9 @@ public struct ContinuityDevice: Identifiable, Equatable {
     public var bluetoothStatus: ((String) -> Void)?
     public var profile: ContinuityProfile? {
         didSet {
-            registry.resetObservations()
+            if oldValue?.accountKey != profile?.accountKey || oldValue?.accountFingerprint != profile?.accountFingerprint {
+                registry.resetObservations()
+            }
             registry.setPeers(profile?.peers ?? [])
             // Services may have resolved before sign-in supplied the account key.
             for service in Array(services.values) where service.hostName != nil { netServiceDidResolveAddress(service) }

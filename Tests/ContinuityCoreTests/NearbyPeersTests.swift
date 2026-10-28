@@ -79,4 +79,35 @@ final class NearbyPeersTests: XCTestCase {
         registry.setConnected([phone.address]); registry.resetObservations()
         XCTAssertFalse(registry.rows(now: now)[0].connected)
     }
+
+    func testContextRefreshKeepsRecentlyAdvertisedConnectability() {
+        var registry = NearbyPeerRegistry(); registry.setPeers([phone])
+        XCTAssertTrue(registry.observeBluetooth(advertisement(), fingerprint: fingerprint, now: now))
+        var contextOnly = advertisement(); contextOnly[18] ^= 3 // type 1 -> type 2; no CoC service in this frame
+        XCTAssertTrue(registry.observeBluetooth(contextOnly, fingerprint: fingerprint, now: now.addingTimeInterval(5)))
+        XCTAssertTrue(registry.rows(now: now.addingTimeInterval(5))[0].bluetoothConnectable)
+        XCTAssertTrue(registry.observeBluetooth(contextOnly, fingerprint: fingerprint, now: now.addingTimeInterval(41)))
+        XCTAssertFalse(registry.rows(now: now.addingTimeInterval(41))[0].bluetoothConnectable)
+    }
+    func testHomePrefersConnectedPhoneWithoutClaimingTabletIsPhone() {
+        XCTAssertEqual(GalaxyPeerPreference.home(peers: [tab, phone], connected: [tab.address, phone.address], nearby: [], selected: tab.address)?.address, phone.address)
+        XCTAssertEqual(GalaxyPeerPreference.home(peers: [tab, phone], connected: [tab.address], nearby: [phone.address], selected: tab.address)?.address, phone.address)
+        XCTAssertEqual(GalaxyPeerPreference.home(peers: [tab], connected: [tab.address], nearby: [], selected: tab.address)?.address, tab.address)
+    }
+
+    func testLegacyAndConcatenatedAdvertisementsMatchTheRegisteredPhone() throws {
+        // Independently generated from Samsung's legacy Bloom-filter and obfuscation rules.
+        let legacy = try XCTUnwrap(Data(hex: "7500021861b1701bfdd35f29e6ce34639126554cbe"))
+        XCTAssertEqual(MCFAdvertisement.cocPSM(manufacturer: legacy, fingerprint: fingerprint, targetAddress: phone.address, now: now), 128)
+        XCTAssertNil(MCFAdvertisement.context(manufacturer: legacy, fingerprint: Data(repeating: 0xFF, count: 32), targetAddress: phone.address, now: now))
+        XCTAssertNil(MCFAdvertisement.context(manufacturer: legacy, fingerprint: fingerprint, targetAddress: tab.address, now: now))
+        let concatenated = legacy + advertisement().dropFirst(2)
+        XCTAssertEqual(MCFAdvertisement.cocPSM(manufacturer: concatenated, fingerprint: fingerprint, targetAddress: phone.address, now: now), 128)
+        var registry = NearbyPeerRegistry(); registry.setPeers([phone, tab])
+        XCTAssertTrue(registry.observeBluetooth(legacy, fingerprint: fingerprint, now: now))
+        XCTAssertTrue(registry.rows(now: now).first { $0.address == phone.address }!.bluetoothConnectable)
+        let context = try XCTUnwrap(MCFAdvertisement.context(manufacturer: legacy, fingerprint: fingerprint, now: now))
+        XCTAssertTrue(MCFAdvertisement.matchesAddress(context: context, address: phone.address))
+        XCTAssertNil(MCFAdvertisement.context(manufacturer: legacy.prefix(8), fingerprint: fingerprint, now: now))
+    }
 }

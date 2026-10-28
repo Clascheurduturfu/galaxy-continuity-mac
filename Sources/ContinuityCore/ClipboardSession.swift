@@ -93,7 +93,13 @@ public enum ClipboardContext {
     public var status: ((String) -> Void)?
     public var hotspotReceived: ((HotspotCredentials) -> Void)?
     /// Waiters for `requestHotspotAnswer`; resumed by the type-4 reply.
-    private var hotspotWaiters: [CheckedContinuation<HotspotCredentials, Error>] = []
+    private var hotspotWaiters: [UUID: CheckedContinuation<HotspotCredentials, Error>] = [:]
+    private var hotspotDeadlines: [UUID: Task<Void, Never>] = [:]
+    private var informationWaiters: [UUID: CheckedContinuation<HotspotInformation, Error>] = [:]
+    private var hotspotSends: [UUID: Task<Void, Never>] = [:]
+    private var informationSends: [UUID: Task<Void, Never>] = [:]
+    private var informationDeadlines: [UUID: Task<Void, Never>] = [:]
+    public var hotspotInformationReceived: ((HotspotInformation) -> Void)?
     public var clientCommandReceived: ((MCFCommand) -> Void)?
     public var tcpOfferReceived: ((Data) -> Void)?
     public func applicationKey(_ appID: UInt8) throws -> Data {
@@ -205,24 +211,64 @@ public enum ClipboardContext {
     /// `hotspotReceived` subscribers still see the answer.
     public func requestHotspotAnswer(timeout: TimeInterval = 15) async throws -> HotspotCredentials {
         guard !key.isEmpty else { throw ContinuityError.message("Connect before requesting Auto Hotspot.") }
-        try await send(handler: 6, command: MCFCommand(id: 3, type: 3, payload: Data([4, 0]) + HotspotCredentials.request()))
-        status?("Requested Samsung Auto Hotspot. Waiting for the phone…")
-        let deadline = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            await self?.failHotspotWaiters(ContinuityError.message("The phone did not answer the Auto Hotspot request in time."))
-        }
-        return try await withCheckedThrowingContinuation { continuation in
-            hotspotWaiters.append(continuation)
-        }
+        try Task.checkCancellation()
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                hotspotWaiters[id] = continuation
+                hotspotDeadlines[id] = Task { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(max(0.01, min(timeout, 60)) * 1_000_000_000))
+                        self?.failHotspotWaiter(id, ContinuityError.message("The phone did not answer the hotspot request."))
+                    } catch { self?.failHotspotWaiter(id, error) }
+                }
+                hotspotSends[id] = Task { [weak self] in
+                    do { try Task.checkCancellation(); try await self?.requestHotspot() }
+                    catch { self?.failHotspotWaiter(id, error) }
+                }
+            }
+        } onCancel: { Task { @MainActor [weak self] in self?.failHotspotWaiter(id, CancellationError()) } }
+    }
+    /// Type 1 discovers status/battery; unlike type 3 it does not activate tethering.
+    public func requestHotspotInformation(timeout: TimeInterval = 10) async throws -> HotspotInformation {
+        guard !key.isEmpty else { throw ContinuityError.message("Connect before checking hotspot status.") }
+        try Task.checkCancellation()
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                informationWaiters[id] = continuation
+                informationDeadlines[id] = Task { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(max(0.01, min(timeout, 60)) * 1_000_000_000))
+                        self?.failInformationWaiter(id, ContinuityError.message("No hotspot status reply. The device may have Auto Hotspot disabled."))
+                    } catch { self?.failInformationWaiter(id, error) }
+                }
+                informationSends[id] = Task { [weak self] in
+                    do { try Task.checkCancellation(); try await self?.send(handler: 6, command: MCFCommand(id: 3, type: 3, payload: Data([4, 0]) + HotspotInformation.request())) }
+                    catch { self?.failInformationWaiter(id, error) }
+                }
+            }
+        } onCancel: { Task { @MainActor [weak self] in self?.failInformationWaiter(id, CancellationError()) } }
     }
     private func resumeHotspotWaiters(_ value: HotspotCredentials) {
-        let waiters = hotspotWaiters; hotspotWaiters = []
-        waiters.forEach { $0.resume(returning: value) }
+        let waiters = hotspotWaiters; hotspotWaiters = [:]
+        for task in hotspotDeadlines.values { task.cancel() }; hotspotDeadlines.removeAll()
+        for task in hotspotSends.values { task.cancel() }; hotspotSends.removeAll()
+        for waiter in waiters.values { waiter.resume(returning: value) }
+    }
+    private func failHotspotWaiter(_ id: UUID, _ error: Error) {
+        hotspotSends.removeValue(forKey: id)?.cancel()
+        hotspotDeadlines.removeValue(forKey: id)?.cancel()
+        hotspotWaiters.removeValue(forKey: id)?.resume(throwing: error)
+    }
+    private func failInformationWaiter(_ id: UUID, _ error: Error) {
+        informationSends.removeValue(forKey: id)?.cancel()
+        informationDeadlines.removeValue(forKey: id)?.cancel()
+        informationWaiters.removeValue(forKey: id)?.resume(throwing: error)
     }
     private func failHotspotWaiters(_ error: Error) {
-        let waiters = hotspotWaiters; hotspotWaiters = []
-        waiters.forEach { $0.resume(throwing: error) }
+        for id in Array(hotspotWaiters.keys) { failHotspotWaiter(id, error) }
+        for id in Array(informationWaiters.keys) { failInformationWaiter(id, error) }
     }
     private func observe(_ context: Data, advertisement: Bool = false) async throws {
         guard !key.isEmpty, let event = try ClipboardContext.event(context), event.sequence != 0, lastRequested != event.sequence || (advertisement && suppressedSequence == event.sequence) else { return }
@@ -310,6 +356,14 @@ public enum ClipboardContext {
             if bytes.count > 2, bytes[0] == 4, bytes[1] == 0 {
                 let value = try JSONDecoder().decode(HotspotCredentials.self, from: Data(bytes.dropFirst(2)))
                 if value.messagetype == 4 { resumeHotspotWaiters(value); hotspotReceived?(value) }
+                if value.messagetype == 2 {
+                    let info = try JSONDecoder().decode(HotspotInformation.self, from: Data(bytes.dropFirst(2)))
+                    let waiters = informationWaiters; informationWaiters = [:]
+                    for task in informationDeadlines.values { task.cancel() }; informationDeadlines.removeAll()
+                    for task in informationSends.values { task.cancel() }; informationSends.removeAll()
+                    for waiter in waiters.values { waiter.resume(returning: info) }
+                    hotspotInformationReceived?(info)
+                }
             }
             return
         }

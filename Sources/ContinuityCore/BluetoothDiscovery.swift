@@ -21,7 +21,7 @@ public final class BluetoothDiscovery: NSObject, CBCentralManagerDelegate, CBPer
         if let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data, data.count >= 2,
            data[data.startIndex] == 0x75, data[data.startIndex + 1] == 0 {
             samsungCount += 1
-            samsungFrames.append(["identifier": peripheral.identifier.uuidString, "manufacturer": data.base64EncodedString(), "connectable": String(describing: advertisementData[CBAdvertisementDataIsConnectable] ?? false)])
+            if samsungFrames.count < 128 { samsungFrames.append(["identifier": peripheral.identifier.uuidString, "manufacturer": data.base64EncodedString(), "connectable": String(describing: advertisementData[CBAdvertisementDataIsConnectable] ?? false)]) }
         }
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []) + (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID] ?? [])
         if services.contains(Self.hotspotService) { hotspotPeers.append(peripheral); found?(peripheral) }

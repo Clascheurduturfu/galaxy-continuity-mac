@@ -33,7 +33,7 @@ public struct NearbyPeer: Identifiable, Equatable {
 public struct NearbyPeerRegistry {
     public static let bluetoothLifetime: TimeInterval = 40
     private var peers: [ContinuityProfile.Peer] = []
-    private var bluetooth: [String: (Date, Bool)] = [:]
+    private var bluetooth: [String: (Date, Date?)] = [:]
     private var network: [String: ContinuityDevice] = [:]
     private var connected = Set<String>()
     public init() {}
@@ -60,12 +60,12 @@ public struct NearbyPeerRegistry {
     @discardableResult public mutating func observeBluetooth(_ manufacturer: Data, fingerprint: Data, now: Date = Date()) -> Bool {
         // A short address hint can collide. Do not assign an ambiguous packet to
         // either account peer, or treat a general Samsung packet as our device.
-        let candidates = peers.filter {
-            MCFAdvertisement.context(manufacturer: manufacturer, fingerprint: fingerprint, targetAddress: $0.address, now: now) != nil
-        }
+        guard let context = MCFAdvertisement.context(manufacturer: manufacturer, fingerprint: fingerprint, now: now) else { return false }
+        let candidates = peers.filter { MCFAdvertisement.matchesAddress(context: context, address: $0.address) }
         guard candidates.count == 1, let peer = candidates.first else { return false }
         let connectable = MCFAdvertisement.cocPSM(manufacturer: manufacturer, fingerprint: fingerprint, targetAddress: peer.address, now: now) != nil
-        bluetooth[Self.key(peer.address)] = (now, connectable)
+        let key = Self.key(peer.address)
+        bluetooth[key] = (now, connectable ? now : bluetooth[key]?.1)
         return true
     }
     public func rows(now: Date = Date()) -> [NearbyPeer] {
@@ -76,7 +76,7 @@ public struct NearbyPeerRegistry {
             let observation = bluetooth[key]
             let fresh = observation.map { now.timeIntervalSince($0.0) >= 0 && now.timeIntervalSince($0.0) <= Self.bluetoothLifetime } ?? false
             return NearbyPeer(id: key, address: peer.address, name: peer.name, deviceType: peer.deviceType,
-                              bluetoothNearby: fresh, bluetoothConnectable: fresh && observation?.1 == true,
+                              bluetoothNearby: fresh, bluetoothConnectable: fresh && observation?.1.map { now.timeIntervalSince($0) >= 0 && now.timeIntervalSince($0) <= Self.bluetoothLifetime } == true,
                               network: network[key], connected: connected.contains(key))
         }.sorted {
             if $0.connected != $1.connected { return $0.connected }
@@ -117,5 +117,20 @@ public struct NearbyPeerRegistry {
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard running, let bytes = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data else { return }
         observed?(bytes)
+    }
+}
+
+/// Home prioritizes a phone without re-routing independent clipboard/feature sessions.
+public enum GalaxyPeerPreference {
+    public static func home(peers: [ContinuityProfile.Peer], connected: [String], nearby: [String], selected: String) -> ContinuityProfile.Peer? {
+        func key(_ s: String) -> String { s.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "").uppercased() }
+        let live = Set(connected.map(key)), seen = Set(nearby.map(key))
+        let phones = peers.filter { $0.deviceType?.lowercased() == "phone" }
+        return phones.first { live.contains(key($0.address)) }
+            ?? phones.first { seen.contains(key($0.address)) }
+            ?? phones.first { key($0.address) == key(selected) }
+            ?? phones.first
+            ?? peers.first { key($0.address) == key(selected) }
+            ?? peers.first
     }
 }

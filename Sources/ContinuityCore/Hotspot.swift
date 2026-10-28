@@ -60,6 +60,18 @@ public struct HotspotCredentials: Decodable, Sendable {
     }
 }
 
+/// Samsung's non-activating status reply (type 2), answered after a type-1 discovery request.
+public struct HotspotInformation: Decodable, Sendable {
+    public let messagetype: Int
+    public let batteryLevel: Int?
+    public let internet_availablity: Bool?
+    public let backhaulnetworktype: Int?
+    public var batteryPercent: Int? { batteryLevel.flatMap { (0...100).contains($0) ? $0 : nil } }
+    public static func request() throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["version": 1, "messagetype": 1, "membertype": 1])
+    }
+}
+
 /// Cache for Auto Hotspot answers, keyed by Bluetooth address. Queries are
 /// on demand only (button click, Wi-Fi-menu open, Wi-Fi-menu click); a cached
 /// answer is reused for `freshWindow` seconds, and everything is dropped on
@@ -69,7 +81,14 @@ public struct HotspotCredentials: Decodable, Sendable {
     /// Inside the 15–30 s window the user asked for.
     public static let freshWindow: TimeInterval = 20
     private var cache: [String: (credentials: HotspotCredentials, at: Date)] = [:]
+    private var information: [String: (HotspotInformation, Date)] = [:]
+    public static let informationWindow: TimeInterval = 300
     public init() {}
+    public func information(address: String) -> HotspotInformation? {
+        guard let value = information[address], Date().timeIntervalSince(value.1) < Self.informationWindow else { return nil }
+        return value.0
+    }
+    public func storeInformation(address: String, value: HotspotInformation) { information[address] = (value, Date()) }
     /// A still-fresh answer for the device, or nil when it must be re-requested.
     public func cached(address: String) -> HotspotCredentials? {
         guard let entry = cache[address], Date().timeIntervalSince(entry.at) <= Self.freshWindow else { return nil }
@@ -77,7 +96,7 @@ public struct HotspotCredentials: Decodable, Sendable {
     }
     public func store(address: String, credentials: HotspotCredentials) { cache[address] = (credentials, Date()) }
     public func invalidate(address: String? = nil) {
-        if let address { cache[address] = nil } else { cache.removeAll() }
+        if let address { cache[address] = nil; information[address] = nil } else { cache.removeAll(); information.removeAll() }
     }
 }
 
@@ -86,7 +105,7 @@ public struct HotspotCredentials: Decodable, Sendable {
 /// Wi-Fi menu entry instead of being asked again on every interaction.
 @MainActor public final class HotspotCapabilityMemory {
     /// How long a "no hotspot" verdict is trusted before it can be re-checked.
-    public static let trustWindow: TimeInterval = 24 * 3600
+    public static let trustWindow: TimeInterval = 120
     private let defaults: UserDefaults
     private let key = "hotspot.unavailableDevices"
     public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
@@ -95,13 +114,13 @@ public struct HotspotCredentials: Decodable, Sendable {
         return value
     }
     private func store(_ table: [String: Double]) {
-        guard let data = try? JSONEncoder().encode(table.filter { Date().timeIntervalSince1970 - $0.value < Self.trustWindow }) else { return }
+        guard let data = try? JSONEncoder().encode(table.filter { Date().timeIntervalSince1970 - abs($0.value) < Self.trustWindow }) else { return }
         defaults.set(data, forKey: key)
     }
     /// True while a recorded failure is still trusted.
     public func unavailable(_ address: String) -> Bool {
         guard let at = table()[address] else { return false }
-        return Date().timeIntervalSince1970 - at < Self.trustWindow
+        return Date().timeIntervalSince1970 - abs(at) < Self.trustWindow
     }
     public func markUnavailable(_ address: String, reason: Int?) {
         var value = table(); value[address] = Date().timeIntervalSince1970; store(value)

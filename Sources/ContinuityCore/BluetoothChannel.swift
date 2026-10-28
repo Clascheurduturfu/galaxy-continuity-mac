@@ -20,29 +20,88 @@ public enum MCFAdvertisement {
         return nil
     }
     public static func context(manufacturer: Data, fingerprint: Data, targetAddress: String? = nil, now: Date = Date()) -> Data? {
-        var raw = Array(manufacturer.dropFirst(2))
-        guard manufacturer.prefix(2) == Data([0x75, 0]), raw.count >= 16, raw[0] == 2, raw[1] == 24, raw[13] & 15 == 1 else { return nil }
-        let table = Array(SHA256.hash(data: fingerprint)), rotation = Int(now.timeIntervalSince1970 * 1000) / 43_200_000
-        let checks = [rotation, rotation - 1].map { r in (0..<10).reduce(UInt8(0)) { $0 ^ table[(($1 - r) % 32 + 32) % 32] } }
-        guard checks.contains(raw[2]) else { return nil }
-        let start = Int(raw[14]), length = Int(raw[15])
-        guard start >= 16, start <= raw.count, length <= raw.count - start else { return nil }
-        let seed = Int(raw[5..<13].reduce(UInt8(0), ^)) % table.count
-        for i in start..<raw.count { raw[i] ^= table[(seed + i) % table.count] }
-        var cursor = start
-        var hint = Data()
-        while cursor < start + length {
+        guard manufacturer.prefix(2) == Data([0x75, 0]), manufacturer.count <= 512, (2...128).contains(fingerprint.count) else { return nil }
+        let packet = Array(manufacturer.dropFirst(2))
+        guard packet.count >= 14 else { return nil }
+        // CoreBluetooth can concatenate the legacy advertisement and its extended
+        // response under one company identifier. Validate each complete frame independently.
+        let starts = [0] + (2..<(packet.count - 1)).filter { packet[$0] == 2 && packet[$0 + 1] == 24 }
+        guard starts.count <= 4 else { return nil }
+        for (index, start) in starts.enumerated().reversed() {
+            let end = index + 1 < starts.count ? starts[index + 1] : packet.count
+            for limit in Set([end, packet.count]).sorted(by: >) {
+                guard let result = decodeFrame(Array(packet[start..<limit]), fingerprint: fingerprint, now: now) else { continue }
+                if let targetAddress, !matchesAddress(context: result, address: targetAddress) { continue }
+                return result
+            }
+        }
+        return nil
+    }
+    static func matchesAddress(context: Data, address: String) -> Bool {
+        guard let target = try? ContinuityProfile.addressBytes(address) else { return false }
+        let raw = Array(context); var cursor = Int(raw[14]); let end = cursor + Int(raw[15])
+        while cursor < end {
             let count = Int(raw[cursor] >> 4), type = raw[cursor] & 15; cursor += 1
-            guard count <= start + length - cursor else { return nil }
-            if type == 4, count == 3 || count == 4 { hint = Data(raw[(cursor + 1)..<(cursor + count)]) }
+            guard count > 0, cursor + count <= end else { return false }
+            if type == 4, count == 3 || count == 4 {
+                return Data(raw[(cursor + 1)..<(cursor + count)]) == Data(target.dropFirst(3).prefix(count - 1))
+            }
             cursor += count
         }
-        if let targetAddress {
-            guard let address = try? ContinuityProfile.addressBytes(targetAddress), !hint.isEmpty,
-                  hint == Data(address.dropFirst(3).prefix(hint.count)) else { return nil }
+        return false
+    }
+    private static func decodeFrame(_ frame: [UInt8], fingerprint: Data, now: Date) -> Data? {
+        guard frame.count >= 14, frame[0] == 2, frame[1] == 24 else { return nil }
+        let table = Array(SHA256.hash(data: fingerprint)), rotation = Int(now.timeIntervalSince1970 * 1000) / 43_200_000
+        var raw = frame
+        if raw[3] & 0x80 != 0 {
+            // Legacy account Bloom filter: Android n9.b/n9.e, Windows BaseAccountHelper.
+            guard raw[3] & 15 == 1, raw[3] >> 4 >= 10, legacyAccountMatches(raw, fingerprint: Array(fingerprint), rotation: rotation) else { return nil }
+            let seed = Int(raw[4..<9].reduce(UInt8(0), ^)) % 32
+            for i in 9..<raw.count { raw[i] ^= table[(seed + i) % 32] }
+            let length = Int(raw[3] >> 4), firstEnd = 4 + length
+            guard firstEnd <= raw.count else { return nil }
+            // Remove the legacy five-byte account field from its CoC LTV and
+            // normalize the context to the same envelope used by extended frames.
+            let fields = [UInt8((length - 5) << 4 | 1)] + Array(raw[9..<firstEnd]) + Array(raw[firstEnd...])
+            guard fields.count <= 255 else { return nil }
+            raw = [2, 24, 0, 0, raw[2]] + [UInt8](repeating: 0, count: 8) + [0x21, 16, UInt8(fields.count)] + fields
+        } else {
+            guard raw.count >= 16, raw[3] & 0x40 == 0, raw[13] & 15 == 1 else { return nil }
+            let checks = [rotation, rotation - 1].map { r in (0..<10).reduce(UInt8(0)) { $0 ^ table[(($1 - r) % 32 + 32) % 32] } }
+            guard checks.contains(raw[2]) else { return nil }
+            let start = Int(raw[14]), length = Int(raw[15])
+            guard start >= 16, start <= raw.count, length <= raw.count - start else { return nil }
+            let seed = Int(raw[5..<13].reduce(UInt8(0), ^)) % 32
+            for i in start..<(start + length) { raw[i] ^= table[(seed + i) % 32] }
+            raw = Array(raw.prefix(start + length))
+        }
+        var cursor = Int(raw[14]); let end = cursor + Int(raw[15])
+        while cursor < end {
+            let count = Int(raw[cursor] >> 4); cursor += 1
+            guard count > 0, cursor + count <= end else { return nil }
+            cursor += count
         }
         return Data(raw)
     }
+    private static func legacyAccountMatches(_ raw: [UInt8], fingerprint: [UInt8], rotation: Int) -> Bool {
+        var flip = [UInt8](repeating: 0, count: 5), remaining = 20
+        for bit in 0..<40 where Int(fingerprint[bit % fingerprint.count]) % (40 - bit) < remaining {
+            flip[4 - bit / 8] |= UInt8(1 << (bit % 8)); remaining -= 1
+        }
+        for r in [rotation, rotation - 1] {
+            var account = [UInt8](repeating: 0, count: fingerprint.count), mask = [UInt8](repeating: 0, count: 5), total = 0
+            for i in fingerprint.indices { account[((i + r) % fingerprint.count + fingerprint.count) % fingerprint.count] = fingerprint[i] }
+            for _ in 0..<9 {
+                total += SHA256.hash(data: Data(account)).reduce(0) { $0 + Int(Int8(bitPattern: $1)) }
+                let bit = abs(total) % 40
+                mask[4 - bit / 8] |= UInt8(1 << (bit % 8)); account[0] &+= 1
+            }
+            if mask.indices.allSatisfy({ ((raw[4 + $0] ^ flip[$0]) & mask[$0]) == mask[$0] }) { return true }
+        }
+        return false
+    }
+
 }
 
 /// Direct BLE credit-based L2CAP connection. All callbacks and callers use the

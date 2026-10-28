@@ -1,68 +1,116 @@
 # Auto Hotspot: native macOS Wi-Fi menu integration
 
-Status: shipped experimentally in v1.1-beta.2 (2026-10-25). Research log and
-design notes; the original PoC write-up lives in the "samsung continuity"
-project folder (`AUTO_HOTSPOT_RESEARCH.md`).
+Status: Beta 3 repair, 2026-10-28. The private research checkout retains both
+`AUTO_HOTSPOT_RESEARCH.md` and the original v4 Objective-C source. They were
+not lost; temporary copies disappearing from `/tmp` did not remove these files.
 
-## 1. What works (PoC, user-verified 2026-10-24/25)
+## 1. Original proof of concept
 
-A hook dylib injected into the processes that own the macOS Wi-Fi menu shows
-the Samsung Galaxy under the native **Personal Hotspots** section — battery,
-signal bars and all — and clicking it enables the phone's hotspot and joins
-it. Verified on the S26 Ultra with a v4 hook: entry appeared, click enabled
-the hotspot in ~1 s and joined in ~5 s, no error dialog.
+The v4 proof of concept was user-tested: a Galaxy appeared under Personal
+Hotspots, a click enabled tethering, and the Mac joined it. Its battery,
+signal and cellular-network labels were hard-coded demonstration values,
+not measurements. That successful test did not validate the rewritten Beta 2 loader.
 
-Mechanics (macOS 14/15):
+WiFiAgent obtains private `SFRemoteHotspotDevice` objects and converts them
+with `__tetherDevicesForRemoteHotspots:` to `CWTetherDevice` objects. The
+conversion/cache methods return sets. The click reaches
+`CWInterface.connectToTetherDevice:remember:error:`; the hook requests Samsung
+credentials through the running app and associates with CoreWLAN.
 
-- `WiFiAgent.app` owns the menu's tether-device data; `ControlCenter.app`
-  renders it. WiFiAgent builds the Personal Hotspots list from
-  `SFRemoteHotspotDevice` objects (private `Sharing.framework`, normally fed
-  by `sharingd`/Instant Hotspot) via `-[CWWiFiAgent
-  __tetherDevicesForRemoteHotspots:]`.
-- Feeding WiFiAgent a fake `SFRemoteHotspotDevice` is enough for the UI.
-- The click path ends in `-[CWInterface connectToTetherDevice:remember:error:]`
-  — the single clean interception point. Earlier attempts that hooked the
-  `internal_enableTetherDevice` path showed the device but failed to connect.
-- `CWNetwork`/`CWTrimmedNetwork.isPersonalHotspot` make the joined SSID
-  display as a Personal Hotspot.
-- Dropping the `SFRemoteHotspotDevice` path and injecting a raw
-  `CWTetherDevice` makes the entry disappear (v3 lesson).
+These are private macOS interfaces. Their presence is checked at runtime;
+compatibility still requires testing on the actual OS version.
 
-## 2. What ships in v1.1-beta.2
+## 2. Beta 2 failure and Beta 3 design
 
-- **App side** (`Sources/ContinuityApp/WiFiMenuHotspot.swift`): an option on
-  the Auto Hotspot page. It checks `csrutil status` (refuses politely when SIP
-  is enabled), copies the bundled dylib into Application Support, exports it
-  through `launchctl setenv DYLD_INSERT_LIBRARIES` and restarts
-  WiFiAgent/ControlCenter. Turning it off unsets the variable and restarts
-  them again.
-- **Hook** (`scripts/wifiagent-hook/GalaxyContinuityWiFiMenuHook.m`, v5
-  rewrite — the v4 sources lived in `/tmp` and were lost): runtime-resolved
-  swizzling with logging to `/tmp/gcl-wifi-menu/hook.log`, KVC against
-  several candidate property names for the fake device, and the v5
-  duplicate-entry fix (while the Mac is connected to the hotspot SSID, the
-  fake entry is suppressed instead of listing next to the joined network).
-- **File protocol** (`/tmp/gcl-wifi-menu`):
+Actual Beta 2 crash reports on the tested Apple Silicon Mac showed DYLD
+termination before the hook constructor: the library had only an `arm64`
+slice while the system processes required `arm64e`. Exporting
+`DYLD_INSERT_LIBRARIES` into the whole GUI launchd environment also affected
+new processes such as System Settings. Compiling the library alone did not
+exercise this failure.
 
-  | File | Direction | Meaning |
-  |---|---|---|
-  | `status.json` | app → hook | display data: name, battery, bars, network, ssid |
-  | `available` | app → hook | touched while a live session + capable device exists; stale after 10 s → the entry hides |
-  | `menu_opened` | hook → app | Wi-Fi menu opened; the app may prefetch |
-  | `trigger` | hook → app | entry clicked; answered via `creds.json` |
-  | `creds.json` | app → hook | `{isSuccess, ssid, password, reason}` |
+Beta 3:
 
-- **Type-3 query policy** (user-specified): queries run **on demand only**
-  (page button, menu open, menu click) — never on scan ticks; answers are
-  cached 20 s (`HotspotCenter`), dropped on wake, disconnect or explicit
-  invalidation; only the **existing** BLE session is used (the watcher never
-  opens a connection); with no live session or a hotspot-less device the
-  entry is hidden via the `available` file.
-- **Capability memory** (`HotspotCapabilityMemory`): devices answering the
-  type-3 request with a failure are excluded from further requests for 24 h
-  (grayed card with Retry on the Auto Hotspot page; excluded from the
-  Wi-Fi menu availability). Wi-Fi-only tablets can't tether — now the app
-  learns it instead of asking every time.
+- Builds both `arm64` and `arm64e` slices on Apple Silicon, and verifies the
+  required architecture before enabling integration.
+- Removes the legacy global injection and opts out of automatically retaining
+  the Beta 2 enabled preference. Migration restarts the affected menu agents.
+- Uses copies of just the WiFiAgent and ControlCenter launch-agent definitions,
+  adding the library to their individual environments. System Settings and
+  unrelated processes are not injected. Disabling restores the stock agents.
+- Bounds helper execution, waits for launchd restart races, checks that both
+  agents are running and requires confirmation from both hook constructors.
+  Installation and rollback run off the app's main thread.
+- Preserves set return types and separate original implementations for the
+  two cached-device selectors. It does not return an SFRemoteHotspotDevice
+  where a CWTetherDevice is required.
+- Uses an owner-only IPC directory and files (0700/0600), rejects symlinks,
+  bounds the hook log, and removes credentials after consumption.
+- Hides the injected entry without a live account-authenticated session and
+  fresh positive hotspot-service status. A currently joined hotspot is not
+  also appended as a second available device.
+
+The IPC remains `/tmp/gcl-wifi-menu`: `status.json`, a short-lived `available`
+heartbeat, `menu_opened`, `trigger`, and one-shot `creds.json`. Credentials
+never go into the log or repository. The hook has no fallback SSID/password.
+
+### Samsung status versus activation
+
+Retained Android `AutoHotspotMDE` code distinguishes these messages:
+
+| Request | Reply | Effect |
+|---|---|---|
+| type 1, same-account member type 1 | type 2 | Reports service status and exact `batteryLevel`; does not enable tethering |
+| type 3 | type 4 | Enables tethering and returns credentials or an activation failure |
+
+The app checks status after an authenticated connection is ready and when the
+Hotspot page is opened, reusing answers for five minutes. Menu opening can
+refresh status over an existing session. Only an explicit Connect action
+requests type 3. Activation answers are cached for 20 seconds and invalidated
+on wake/disconnect. No request is sent on every advertisement/scan tick.
+
+Battery is displayed only if Samsung reports a valid percentage (including
+zero). Signal bars and cellular technology are not invented. No status reply
+means unknown: the Auto Hotspot setting or account policy may prevent a reply.
+In particular activation failure **-6 means Auto Hotspot is disabled**, not
+that the hardware cannot tether. Activation failures suppress automatic
+attempts briefly (two minutes); Retry clears the failure and status backoff.
+A 24-hour/week-long negative capability verdict would incorrectly hide a
+phone after changing its setting, so it is deliberately not used here.
+
+## Phone discovery and clipboard context
+
+A live capture on the tested Mac contained a 76-byte Samsung manufacturer
+value: the company identifier, a 33-byte legacy frame and a 41-byte extended
+frame concatenated together. The previous parser assumed a single extended
+frame at offset zero and rejected this phone, while accepting the tablet's
+standalone extended advertisement. Samsung's retained Android and Windows
+implementations confirm that these layouts use different account-filter and
+obfuscation offsets.
+
+The parser now validates each bounded candidate frame independently, supports
+the legacy account Bloom filter/bit-flip mask and normalizes legacy context
+LTVs. Matching an account advertisement remains a candidate check: the
+registered-device/account handshake still authenticates every connection.
+No phone address, fingerprint or captured advertisement is included in source.
+This also lets a connected phone's clipboard-context updates reach the
+clipboard reader when they arrive in either advertisement layout.
+
+Discovery retains the last CoC connectability fact for its normal 40-second
+freshness window when a context-only advertisement arrives; it no longer
+immediately downgrades a connectable peer on that one frame. Updating the same
+account profile also no longer erases all proximity observations. Home's
+phone preference is separate from per-device service/clipboard routing;
+automatic fallback does not silently replace the saved preferred peer.
+
+## Validation log
+
+- Beta 3 status, exact-battery parsing, fast-reply waiter race, device preference
+  and interleaved advertisement tests added to the core suite.
+- On the tested macOS 27.0.1 Mac, a scoped probe loaded both hook constructors,
+  both agents remained running, and System Settings opened while injected.
+  The probe restored the stock agents afterward. This checks real loading;
+  a full native-menu activation/join still needs a live click test.
 
 ## 3. Can this be done with SIP enabled? (research, 2026-10-25)
 

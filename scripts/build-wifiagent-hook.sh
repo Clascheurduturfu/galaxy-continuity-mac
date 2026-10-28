@@ -5,7 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p dist
-clang -dynamiclib -O2 -fobjc-arc -Wall \
+arches=()
+if [[ "$(uname -m)" == arm64 ]]; then arches=(-arch arm64 -arch arm64e); fi
+clang "${arches[@]}" -dynamiclib -mmacosx-version-min=13.0 -O2 -fobjc-arc -Wall \
   -framework Foundation -framework CoreWLAN \
   -o dist/GalaxyContinuityWiFiMenuHook.dylib \
   scripts/wifiagent-hook/GalaxyContinuityWiFiMenuHook.m

@@ -2,3 +2,5 @@
 *.swift text eol=lf
 *.py text eol=lf
 *.md text eol=lf
+
+*.m text eol=lf

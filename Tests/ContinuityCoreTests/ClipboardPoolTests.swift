@@ -67,4 +67,52 @@ final class ClipboardPoolTests: XCTestCase {
         XCTAssertTrue(pool.sessions.isEmpty); XCTAssertTrue(wires.allSatisfy { $0.cancellations > 0 })
         pool.stop()
     }
+
+    @MainActor func testHotspotStatusWaiterReceivesImmediateReplyBeforeSendReturns() async throws {
+        let wire = ImmediateHotspotWire()
+        let session = ClipboardSession(connection: wire, profile: try WireTests().profile()); wire.session = session
+        try await session.start(key: wire.key, peer: "Test phone", address: "10:11:22:33:44:55")
+        let info = try await session.requestHotspotInformation(timeout: 0.1)
+        XCTAssertEqual(info.batteryPercent, 73)
+        XCTAssertEqual(wire.requestTypes, [1], "Status must not activate the hotspot")
+        session.stop()
+    }
+    @MainActor private final class ImmediateHotspotWire: MCFConnection {
+        let key = Data(repeating: 0x42, count: 32)
+        weak var session: ClipboardSession?
+        var requestTypes: [Int] = []
+        func connect() async throws {}
+        func cancel() {}
+        func receive() async throws -> MCFPacket { throw CancellationError() }
+        func send(_ packet: MCFPacket) async throws {
+            guard packet.handler == 6 else { return }
+            let command = try MCFCommand(data: MCFCrypto.cbc(packet.payload, key: key, encrypt: false))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: command.payload.dropFirst(2)) as? [String: Int])
+            requestTypes.append(try XCTUnwrap(json["messagetype"]))
+            let bytes = try JSONSerialization.data(withJSONObject: ["messagetype": 2, "batteryLevel": 73])
+            try await session?.handleIncoming(handler: 6, command: MCFCommand(id: 3, type: 3, payload: Data([4,0]) + bytes), context: Data())
+        }
+    }
+
+    @MainActor func testHotspotStatusDeadlineCoversAStalledSend() async throws {
+        let wire = StalledHotspotWire()
+        let session = ClipboardSession(connection: wire, profile: try WireTests().profile())
+        try await session.start(key: Data(repeating: 0x42, count: 32), peer: "Test phone", address: "10:11:22:33:44:55")
+        let finished = expectation(description: "Status deadline returns while send is stalled")
+        let request = Task {
+            do { _ = try await session.requestHotspotInformation(timeout: 0.05); XCTFail("Expected a bounded timeout") }
+            catch { finished.fulfill() }
+        }
+        await fulfillment(of: [finished], timeout: 3)
+        request.cancel(); session.stop()
+        await request.value
+    }
+    @MainActor private final class StalledHotspotWire: MCFConnection {
+        func connect() async throws {}
+        func cancel() {}
+        func receive() async throws -> MCFPacket { throw CancellationError() }
+        func send(_ packet: MCFPacket) async throws {
+            if packet.handler == 6 { try await Task.sleep(nanoseconds: 60_000_000_000) }
+        }
+    }
 }

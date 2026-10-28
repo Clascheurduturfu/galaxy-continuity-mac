@@ -1,4 +1,4 @@
-// GalaxyContinuityWiFiMenuHook.m — v5
+// GalaxyContinuityWiFiMenuHook.m — v6
 //
 // Shows the user's Samsung Galaxy under the native macOS Wi-Fi menu's
 // "Personal Hotspots" section and joins it when clicked. Loaded through
@@ -15,8 +15,8 @@
 //
 // Everything resolves classes and selectors at runtime and no-ops when they
 // are missing, so the dylib is inert in processes that lack CoreWLAN
-// internals. Rewritten in v5 from the working v4 PoC; /tmp leftovers of v4
-// were lost, so selectors follow the PoC notes and log loudly for debugging.
+// internals. The retained v4 source is the reference; private selectors are checked
+// at runtime and collection return types are preserved.
 
 #import <Foundation/Foundation.h>
 #import <CoreWLAN/CoreWLAN.h>
@@ -26,40 +26,50 @@
 #import <sys/time.h>
 #import <time.h>
 #import <unistd.h>
+#import <fcntl.h>
 
 #pragma mark - Files and logging
 
 static NSString *GCLDir(void) { return @"/tmp/gcl-wifi-menu"; }
-static NSString *GCLPath(NSString *name) { return [GCLDir() stringByAppendingPathComponent:name]; }
 
+// Validate the owner-only IPC directory and use openat/O_NOFOLLOW for every file.
+static int GCLDirectoryFD(void) {
+    int fd = open(GCLDir().fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat info;
+    if (fd >= 0 && (fstat(fd, &info) || info.st_uid != getuid() || (info.st_mode & 077) != 0)) { close(fd); return -1; }
+    return fd;
+}
+static int GCLOpen(NSString *name, int flags) {
+    int directory = GCLDirectoryFD(); if (directory < 0) return -1;
+    int fd = openat(directory, name.fileSystemRepresentation, flags | O_NOFOLLOW | O_CLOEXEC, 0600); close(directory);
+    struct stat info;
+    if (fd >= 0 && (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != getuid() || info.st_nlink != 1 || (info.st_mode & 077) != 0)) { close(fd); return -1; }
+    return fd;
+}
 static void GCLLog(NSString *format, ...) {
     va_list args; va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args]; va_end(args);
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [[NSProcessInfo processInfo] processName], message];
-    FILE *file = fopen(GCLPath(@"hook.log").fileSystemRepresentation, "a");
-    if (file) { fputs(line.UTF8String, file); fclose(file); }
+    int fd = GCLOpen(@"hook.log", O_WRONLY | O_APPEND | O_CREAT);
+    if (fd >= 0) { struct stat info; if (!fstat(fd, &info) && info.st_size < 262144) { NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding]; write(fd, data.bytes, data.length); } close(fd); }
 }
-
 static void GCLTouch(NSString *name) {
-    mkdir(GCLDir().fileSystemRepresentation, 0755);
-    close(open(GCLPath(name).fileSystemRepresentation, O_CREAT | O_WRONLY, 0644));
-    utimes(GCLPath(name).fileSystemRepresentation, NULL);
+    int fd = GCLOpen(name, O_CREAT | O_WRONLY); if (fd >= 0) { futimes(fd, NULL); close(fd); }
 }
-
-static void GCLRemove(NSString *name) { unlink(GCLPath(name).fileSystemRepresentation); }
-
+static void GCLRemove(NSString *name) {
+    int directory = GCLDirectoryFD(); if (directory >= 0) { unlinkat(directory, name.fileSystemRepresentation, 0); close(directory); }
+}
 static NSDictionary *GCLReadJSON(NSString *name) {
-    NSData *data = [NSData dataWithContentsOfFile:GCLPath(name)];
-    if (!data) return nil;
+    int fd = GCLOpen(name, O_RDONLY); if (fd < 0) return nil;
+    struct stat info; if (fstat(fd, &info) || info.st_size > 65536) { close(fd); return nil; }
+    NSFileHandle *handle = [[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES];
+    NSData *data = [handle readDataToEndOfFile]; [handle closeFile];
     id value = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
     return [value isKindOfClass:[NSDictionary class]] ? value : nil;
 }
-
 static BOOL GCLAvailableFresh(void) {
-    struct stat info;
-    if (stat(GCLPath(@"available").fileSystemRepresentation, &info) != 0) return NO;
-    return time(NULL) - info.st_mtime <= 10;
+    int fd = GCLOpen(@"available", O_RDONLY); if (fd < 0) return NO;
+    struct stat info; BOOL valid = !fstat(fd, &info) && time(NULL) >= info.st_mtime && time(NULL) - info.st_mtime <= 10; close(fd); return valid;
 }
 
 #pragma mark - Status snapshot
@@ -73,12 +83,12 @@ typedef struct {
 } GCLStatus;
 
 static GCLStatus GCLLoadStatus(void) {
-    GCLStatus st = {NO, @"Galaxy", @"", 88, 4, @"5G"};
+    GCLStatus st = {NO, @"Galaxy", @"", -1, -1, nil};
     if (!GCLAvailableFresh()) return st;
     NSDictionary *json = GCLReadJSON(@"status.json");
     if (!json) return st;
     st.name = json[@"name"] ?: st.name;
-    st.battery = [json[@"battery"] integerValue] ?: st.battery;
+    if ([json[@"battery"] isKindOfClass:[NSNumber class]]) st.battery = [json[@"battery"] integerValue];
     st.bars = [json[@"bars"] integerValue] ?: st.bars;
     st.network = json[@"network"] ?: st.network;
     st.ssid = json[@"ssid"] ?: @"";
@@ -110,6 +120,10 @@ static NSString *GCLFakeAddress(void) { return @"AA:BB:CC:DD:EE:FF"; }
 
 static BOOL GCLIsOurDevice(id device) {
     if (!device) return NO;
+    if ([device respondsToSelector:NSSelectorFromString(@"deviceIdentifier")]) {
+        id identifier = ((id (*)(id, SEL))objc_msgSend)(device, NSSelectorFromString(@"deviceIdentifier"));
+        if ([identifier isKindOfClass:[NSString class]] && [identifier isEqualToString:GCLFakeAddress()]) return YES;
+    }
     // CWTetherDevice exposes the source remote hotspot's address; our fake is
     // recognized by its marker address.
     if ([device respondsToSelector:@selector(address)]) {
@@ -136,7 +150,7 @@ static id GCLMakeFakeRemoteDevice(GCLStatus st) {
     NSDictionary *candidates = @{
         @"name": st.name, @"deviceName": st.name, @"displayName": st.name,
         @"address": GCLFakeAddress(), @"remoteAddress": GCLFakeAddress(), @"uniqueID": GCLFakeAddress(),
-        @"identifier": GCLFakeAddress(), @"deviceID": GCLFakeAddress()
+        @"identifier": GCLFakeAddress(), @"deviceID": GCLFakeAddress(), @"deviceIdentifier": GCLFakeAddress()
     };
     for (NSString *key in candidates) {
         @try {
@@ -144,6 +158,9 @@ static id GCLMakeFakeRemoteDevice(GCLStatus st) {
                 [device setValue:candidates[key] forKey:key];
             }
         } @catch (NSException *e) { GCLLog(@"fake KVC %@: %@", key, e.reason); }
+    }
+    if (st.battery >= 0 && st.battery <= 100) {
+        @try { [device setValue:@(st.battery) forKey:@"batteryLife"]; } @catch (NSException *e) {}
     }
     return device;
 }
@@ -154,7 +171,7 @@ static void GCLSwap(Class cls, SEL selector, IMP implementation, IMP *original) 
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) { GCLLog(@"missing method -[%@ %@]", cls, NSStringFromSelector(selector)); return; }
     *original = method_getImplementation(method);
-    method_setImplementation(method, implementation);
+    if (!class_addMethod(cls, selector, implementation, method_getTypeEncoding(method))) method_setImplementation(method, implementation);
     GCLLog(@"hooked -[%@ %@]", cls, NSStringFromSelector(selector));
 }
 
@@ -172,30 +189,32 @@ static void gcl_hook_updatedFoundDevices(id self, SEL _cmd, id session, NSArray 
     GCLStatus st = GCLLoadStatus();
     if (st.ok && !GCLConnectedToHotspot()) {
         id fake = GCLMakeFakeRemoteDevice(st);
-        if (fake && ![devices containsObject:fake]) devices = [devices arrayByAddingObject:fake];
+        if (fake && ![devices containsObject:fake]) devices = [(devices ?: @[]) arrayByAddingObject:fake];
     }
     if (gcl_orig_updatedFoundDevices) ((void (*)(id, SEL, id, NSArray *)) gcl_orig_updatedFoundDevices)(self, _cmd, session, devices);
 }
 
-static IMP gcl_orig_cachedTetherDevices;
-static NSArray *gcl_hook_cachedTetherDevices(id self, SEL _cmd) {
-    NSArray *original = gcl_orig_cachedTetherDevices
-        ? ((NSArray *(*)(id, SEL)) gcl_orig_cachedTetherDevices)(self, _cmd) : @[];
+static IMP gcl_orig_cachedTetherDevices, gcl_orig_cachedCurrent;
+static id GCLCached(id self, SEL cmd, IMP originalIMP) {
+    id original = originalIMP ? ((id (*)(id, SEL))originalIMP)(self, cmd) : nil;
     GCLStatus st = GCLLoadStatus();
     if (!st.ok || GCLConnectedToHotspot()) return original;
     id fake = GCLMakeFakeRemoteDevice(st);
-    if (!fake) return original;
-    // Let the agent run its own SFRemoteHotspotDevice -> CWTetherDevice
-    // conversion so the menu entry is built exactly like Apple's.
     SEL convert = NSSelectorFromString(@"__tetherDevicesForRemoteHotspots:");
-    if ([self respondsToSelector:convert]) {
-        NSArray *converted = ((NSArray *(*)(id, SEL, NSArray *)) objc_msgSend)(self, convert, @[fake]);
-        if (converted.count == 1) return [original arrayByAddingObjectsFromArray:converted];
-        GCLLog(@"conversion returned %lu", (unsigned long)converted.count);
+    if (!fake || ![self respondsToSelector:convert]) return original;
+    id converted = ((id (*)(id, SEL, id))objc_msgSend)(self, convert, @[fake]);
+    // macOS returns NSSet here, not NSArray. Never send an array selector to a set.
+    if ([converted isKindOfClass:[NSSet class]]) {
+        NSMutableSet *merged = [NSMutableSet set];
+        if ([original isKindOfClass:[NSSet class]]) [merged unionSet:original];
+        else if ([original isKindOfClass:[NSArray class]]) [merged addObjectsFromArray:original];
+        [merged unionSet:converted]; return [merged copy];
     }
-    // Fallback: surface the remote device directly; some builds accept it.
-    return [original arrayByAddingObject:fake];
+    if ([converted isKindOfClass:[NSArray class]] && [original isKindOfClass:[NSArray class]]) return [original arrayByAddingObjectsFromArray:converted];
+    return original;
 }
+static id gcl_hook_cachedTetherDevices(id self, SEL cmd) { return GCLCached(self, cmd, gcl_orig_cachedTetherDevices); }
+static id gcl_hook_cachedCurrent(id self, SEL cmd) { return GCLCached(self, cmd, gcl_orig_cachedCurrent); }
 
 #pragma mark - CWInterface hooks
 
@@ -207,17 +226,21 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
             : NO;
     }
     GCLLog(@"our tether device clicked: joining via the app");
+    if ([NSThread isMainThread]) { if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:5 userInfo:@{NSLocalizedDescriptionKey: @"Use Connect in Galaxy Continuity for this macOS menu path."}]; return NO; }
     GCLRemove(@"creds.json");
     GCLTouch(@"trigger");
     NSDictionary *creds = nil;
     for (int i = 0; i < 100 && !creds; i++) { usleep(100000); creds = GCLReadJSON(@"creds.json"); }
     if (!creds) { GCLLog(@"no creds.json within 10 s"); if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:1 userInfo:@{NSLocalizedDescriptionKey: @"The phone did not answer in time."}]; return NO; }
+    GCLRemove(@"creds.json");
     if (![creds[@"isSuccess"] boolValue]) {
         GCLLog(@"creds report failure reason %@", creds[@"reason"]);
         if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:2 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"The phone declined the hotspot request (reason %@).", creds[@"reason"] ?: @"?"]}];
         return NO;
     }
     NSString *ssid = creds[@"ssid"], *password = creds[@"password"];
+    GCLRemove(@"creds.json");
+    if (![ssid isKindOfClass:[NSString class]] || !ssid.length || ![password isKindOfClass:[NSString class]]) return NO;
     NSData *ssidData = [ssid dataUsingEncoding:NSUTF8StringEncoding];
     NSArray *networks = nil;
     if ([self respondsToSelector:@selector(scanForNetworksWithSSID:error:)]) {
@@ -234,20 +257,8 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
     }
     if (networks.count == 0) { GCLLog(@"hotspot ssid not found in scan"); if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:3 userInfo:@{NSLocalizedDescriptionKey: @"The phone's hotspot was not visible yet."}]; return NO; }
     BOOL ok = ((BOOL (*)(id, SEL, id, id, NSError **)) objc_msgSend)(self, @selector(associateToNetwork:password:error:), networks.firstObject, password, error);
-    GCLLog(@"associate ssid=%@ ok=%d", ssid, ok);
+    GCLLog(@"hotspot association ok=%d", ok);
     return ok;
-}
-
-static IMP gcl_orig_lastTetherDeviceJoined;
-static id gcl_hook_lastTetherDeviceJoined(id self, SEL _cmd) {
-    GCLStatus st = GCLLoadStatus();
-    if (st.ok && GCLConnectedToHotspot()) {
-        // Report our fake as the last joined tether device so the menu marks
-        // the hotspot as connected rather than a plain network.
-        return GCLMakeFakeRemoteDevice(st);
-    }
-    return gcl_orig_lastTetherDeviceJoined
-        ? ((id (*)(id, SEL)) gcl_orig_lastTetherDeviceJoined)(self, _cmd) : nil;
 }
 
 #pragma mark - CWNetwork / CWTrimmedNetwork display hooks
@@ -270,25 +281,21 @@ static BOOL gcl_hook_networkIsPersonalHotspot(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void gcl_init(void) {
-    mkdir(GCLDir().fileSystemRepresentation, 0755);
+    NSString *processName = [NSProcessInfo processInfo].processName;
+    if (![@[@"WiFiAgent", @"ControlCenter"] containsObject:processName]) return;
+    int directory = GCLDirectoryFD(); if (directory < 0) return; close(directory);
     GCLLog(@"hook loaded");
     Class agent = NSClassFromString(@"CWWiFiAgent");
     if (agent) {
         GCLSwap(agent, NSSelectorFromString(@"internal_startBrowsingForTetherDevicesAndReply:"), (IMP)gcl_hook_startBrowsing, &gcl_orig_startBrowsing);
         GCLSwap(agent, NSSelectorFromString(@"session:updatedFoundDevices:"), (IMP)gcl_hook_updatedFoundDevices, &gcl_orig_updatedFoundDevices);
         GCLSwap(agent, NSSelectorFromString(@"__cachedTetherDevices"), (IMP)gcl_hook_cachedTetherDevices, &gcl_orig_cachedTetherDevices);
-        SEL cachedCurrent = NSSelectorFromString(@"__cachedTetherDevicesFromCurrentBrowseSession");
-        if (class_getInstanceMethod(agent, cachedCurrent)) {
-            // Shares the cachedTetherDevices hook; the selector differs only in name.
-            Method method = class_getInstanceMethod(agent, cachedCurrent);
-            method_setImplementation(method, (IMP)gcl_hook_cachedTetherDevices);
-            GCLLog(@"hooked -[CWWiFiAgent __cachedTetherDevicesFromCurrentBrowseSession]");
-        }
+        GCLSwap(agent, NSSelectorFromString(@"__cachedTetherDevicesFromCurrentBrowseSession"), (IMP)gcl_hook_cachedCurrent, &gcl_orig_cachedCurrent);
     }
     Class interface = NSClassFromString(@"CWInterface");
     if (interface) {
         GCLSwap(interface, @selector(connectToTetherDevice:remember:error:), (IMP)gcl_hook_connectTether, &gcl_orig_connectTether);
-        GCLSwap(interface, @selector(lastTetherDeviceJoined), (IMP)gcl_hook_lastTetherDeviceJoined, &gcl_orig_lastTetherDeviceJoined);
+        // Keep stock lastTetherDeviceJoined: it must return a CWTetherDevice, not an SFRemoteHotspotDevice.
     }
     for (NSString *name in @[@"CWNetwork", @"CWTrimmedNetwork"]) {
         Class network = NSClassFromString(name);

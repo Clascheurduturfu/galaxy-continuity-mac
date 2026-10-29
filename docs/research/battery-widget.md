@@ -2,6 +2,32 @@
 
 Research dates: 2026-10-28–29. Tested on Apple Silicon, macOS 27.0.1.
 
+## RC2 phone-shaped icon
+
+The owner confirmed RC1 works in the actual widget. Its Bluetooth glyph was
+Apple's fallback for an unknown Bluetooth accessory. A local runtime probe
+queried the native `batteryWidgetGlyphName:` selector: third-party accessory
+categories provide speaker, headphone, keyboard, trackpad, mouse and hearing
+device glyphs, but no generic phone glyph.
+
+RC2 uses Apple's R5x Smart Battery Case display representation for peers
+whose authenticated account device type is `phone`. The IOKit display hints
+are category `Battery Case`, AID transport, USB vendor 1452/product 5016 and
+vendor-source 2. Apple's selector resolves that combination to
+`iphone.smartbatterycase.gen2`, a phone-shaped case icon. These compatibility
+hints describe the widget representation, not the real manufacturer's radio
+identity or connection. Samsung account authentication and Bluetooth pairing
+are unchanged. Non-phone/unknown peer types retain the generic representation.
+
+The actual system widget accepted a clearly named test record with those
+hints, its supplied percentage and unknown power state. Its constructed
+device remained `internal = NO` and `powerSource = NO`. The record's name and
+stable Galaxy identifier stay intact; percentages, charging-state handling,
+expiry, privacy and cleanup are unchanged. Glyph-only changes update the
+existing record rather than creating a duplicate. No additional injection
+or background polling is introduced. This selects a phone-battery-case
+silhouette; it is not an arbitrary custom Samsung icon.
+
 ## RC1 implementation and current result
 
 RC1 publishes fresh authenticated Galaxy readings to Apple's native Batteries
@@ -14,17 +40,20 @@ a clearly named synthetic test accessory, constructing a connected device
 with the supplied percentage, category `Unknown`, and power state `Unknown`.
 Thus the widget's own consumer path is verified, beyond `pmset` registration.
 The independent unprivileged BatteryCenter reader still returns no devices
-and must not be used as the acceptance criterion. A real-phone visual test
-requires the phone nearby, authenticated and reporting a fresh percentage;
-the connected Wi-Fi-only tablet supplied no battery report during this run.
+and must not be used as the acceptance criterion. The owner subsequently
+confirmed RC1 works in the real widget and requested the phone-shaped icon.
+RC2's new appearance still needs a live visual check. A Galaxy must be nearby,
+authenticated and reporting a fresh percentage; the Wi-Fi-only tablet supplied
+no battery report during the initial RC1 run.
 
 The implementation:
 
 - Registers only `Accessory Source`, never `InternalBattery` or UPS.
 - Uses a stable hashed Bluetooth identity and the authenticated device name;
   it does not expose the raw identity or account credentials to the registry.
-- Uses the accepted generic category and unknown power state. No keyboard,
-  fake charging state or fabricated battery percentage is needed.
+- Uses unknown power state with no fake charging state or fabricated battery
+  percentage. RC1 used a generic accessory category; RC2's phone display
+  compatibility hints are documented above.
 - Rewrites macOS details only when name or percentage changes, and reuses
   the five-minute status cache. Only previously reporting connected peers
   are queried again after expiry; widget redraws never poll Bluetooth.

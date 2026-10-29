@@ -8,9 +8,12 @@ public struct GalaxyBatterySample: Equatable, Sendable {
     public let name: String
     public let percent: Int
     public let receivedAt: Date
-    public init(address: String, name: String, percent: Int, receivedAt: Date) {
+    public let deviceType: String?
+    public init(address: String, name: String, percent: Int, receivedAt: Date, deviceType: String? = nil) {
         self.address = address; self.name = name; self.percent = percent; self.receivedAt = receivedAt
+        self.deviceType = deviceType
     }
+    var usesPhoneGlyph: Bool { deviceType?.lowercased() == "phone" }
     var identifier: String? {
         guard let bytes = try? ContinuityProfile.addressBytes(address), bytes.count == 6 else { return nil }
         return "local.galaxy-continuity.battery." + SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
@@ -21,10 +24,13 @@ public struct GalaxyBatterySample: Equatable, Sendable {
         return text.isEmpty ? "Galaxy device" : text
     }
     var details: [String: Any] {
-        ["Type": "Accessory Source", "Accessory Category": "Unknown", "Accessory Identifier": identifier ?? "",
-         "Name": displayName, "Transport Type": "Bluetooth", "Power Source State": "Unknown",
+        ["Type": "Accessory Source", "Accessory Category": usesPhoneGlyph ? "Battery Case" : "Unknown", "Accessory Identifier": identifier ?? "",
+         "Name": displayName, "Transport Type": usesPhoneGlyph ? "AID" : "Bluetooth", "Power Source State": "Unknown",
          "Current Capacity": percent, "Max Capacity": 100, "Is Present": true,
-         "Vendor ID": 117, "Vendor ID Source": 1, "Product ID": 65535]
+         "Vendor ID": usesPhoneGlyph ? 1452 : 117, "Vendor ID Source": usesPhoneGlyph ? 2 : 1, "Product ID": usesPhoneGlyph ? 5016 : 65535]
+        // Display-only compatibility hints: Apple has no generic phone glyph.
+        // Its R5x battery-case representation selects iphone.smartbatterycase.gen2.
+        // These fields never change Bluetooth pairing, radio transport or MCF identity.
         // Samsung does not report charging state here. Neither Is Charging nor
         // an invented AC/Battery Power state is published. This is never a UPS
         // or InternalBattery, so it cannot replace the Mac's battery.
@@ -129,7 +135,7 @@ final class IOKitAccessoryBackend: AccessoryPowerSourceBackend {
         failures = failures.filter { valid[$0.key] != nil && retryAfter[$0.key] != nil }
         for (id, sample) in valid {
             if var entry = entries[id] {
-                if entry.sample.percent != sample.percent || entry.sample.displayName != sample.displayName {
+                if entry.sample.percent != sample.percent || entry.sample.displayName != sample.displayName || entry.sample.usesPhoneGlyph != sample.usesPhoneGlyph {
                     let result = backend.update(entry.handle, details: sample.details)
                     guard result == 0 else { failed(id, code: result, now: now); continue }
                 }

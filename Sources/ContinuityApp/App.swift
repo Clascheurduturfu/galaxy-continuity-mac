@@ -143,7 +143,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
         let samples = (profile?.peers ?? []).compactMap { peer -> GalaxyBatterySample? in
             guard let link = clipboardSession(for: peer.address), let address = link.peerAddress,
                   let snapshot = hotspotCenter.informationSnapshot(address: address), let percent = snapshot.value.batteryPercent else { return nil }
-            return GalaxyBatterySample(address: address, name: peer.name, percent: percent, receivedAt: snapshot.receivedAt)
+            return GalaxyBatterySample(address: address, name: peer.name, percent: percent, receivedAt: snapshot.receivedAt, deviceType: peer.deviceType)
         }
         batteryPublisher.synchronize(samples)
     }

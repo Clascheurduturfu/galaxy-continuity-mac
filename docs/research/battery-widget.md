@@ -1,6 +1,43 @@
 # Galaxy batteries and the macOS Batteries widget
 
-Research date: 2026-10-28. Tested on Apple Silicon, macOS 27.0.1.
+Research dates: 2026-10-28–29. Tested on Apple Silicon, macOS 27.0.1.
+
+## RC1 implementation and current result
+
+RC1 publishes fresh authenticated Galaxy readings to Apple's native Batteries
+widget through IOKit accessory power sources. It does not install another
+widget extension or inject code into the widget. The Settings switch is on
+by default; turning it off removes this app's published entries.
+
+The actual `BatteriesAvocadoWidgetExtension` process was observed receiving
+a clearly named synthetic test accessory, constructing a connected device
+with the supplied percentage, category `Unknown`, and power state `Unknown`.
+Thus the widget's own consumer path is verified, beyond `pmset` registration.
+The independent unprivileged BatteryCenter reader still returns no devices
+and must not be used as the acceptance criterion. A real-phone visual test
+requires the phone nearby, authenticated and reporting a fresh percentage;
+the connected Wi-Fi-only tablet supplied no battery report during this run.
+
+The implementation:
+
+- Registers only `Accessory Source`, never `InternalBattery` or UPS.
+- Uses a stable hashed Bluetooth identity and the authenticated device name;
+  it does not expose the raw identity or account credentials to the registry.
+- Uses the accepted generic category and unknown power state. No keyboard,
+  fake charging state or fabricated battery percentage is needed.
+- Rewrites macOS details only when name or percentage changes, and reuses
+  the five-minute status cache. Only previously reporting connected peers
+  are queried again after expiry; widget redraws never poll Bluetooth.
+- Removes entries on disconnect, disabled sharing, sleep, expiry and quit.
+  After wake or a system clock change it discards old samples and requests
+  fresh status. A bounded cleanup retry preserves failed handle ownership;
+  errors stay visible even if sharing was disabled.
+- Retries transient publication failures using cached readings and a single
+  scheduled task, without another phone query. There is no wake lock.
+
+Apple controls the widget's redraw cadence and generic accessory icon. No
+extra SIP setting, admin helper, phone app, ADB dependency or Keychain change
+was introduced. The existing experimental Wi-Fi-menu hook is independent.
 
 ## Where the phone percentage comes from
 
@@ -72,20 +109,17 @@ Samsung-reported percentage. Create and set-details returned success;
 The process ran without root, new entitlements, injection or SIP changes.
 
 The source needs `Power Source State`; leaving it out returned bad argument.
-The probe used a test state solely to validate registration. A production
-bridge must not invent charging status from the percentage. It also needs
-stable per-device identity, change-only updates, and removal on disconnect,
-stale data and quit. Only accessory sources should be published; the Galaxy
-must never be registered as the Mac's internal battery or UPS.
+The first probe used a test state solely to validate registration. RC1 then
+verified that `Unknown` is accepted, with no `Is Charging` boolean, and uses
+that representation. Only accessory sources are published; the Galaxy is
+never registered as the Mac's internal battery or UPS.
 
 The independent BatteryCenter reader instantiated the modern controller and
 registered an observer, but returned no connected devices. Thus accessory
-registry publication is **demonstrated**, whereas visibility in the stock
-Batteries widget remains **unverified**. This is a credible private-API route,
-not a completed feature or evidence that a phone category renders correctly.
-Next: inspect the actual widget while a temporary source exists and compare
-accepted category/identity fields with a genuine accessory. No permanent
-publisher is enabled in this release.
+registry publication was demonstrated first, while widget consumption was
+initially unverified. The RC1 consumer trace described above resolves that
+gap using the actual system widget process. Its real-phone visual acceptance
+remains separate from the controlled fixture and lifecycle tests.
 
 If Apple filters this source, a dedicated Galaxy Continuity WidgetKit
 extension can read the application's cached reports. That would be our own

@@ -117,6 +117,9 @@ enum HotspotInformationQueryState { case checking, unanswered }
     private var lanTimer: Timer?
     private var pathMonitor: NWPathMonitor?
     private var wakeObserver: NSObjectProtocol?
+    private var sleepObserver: NSObjectProtocol?
+    private var terminationObserver: NSObjectProtocol?
+    private var clockObserver: NSObjectProtocol?
     var lastChange = NSPasteboard.general.changeCount
     var joiningHotspot = false
     var hotspotJoiner = HotspotJoiner()
@@ -125,6 +128,33 @@ enum HotspotInformationQueryState { case checking, unanswered }
     /// Devices that answered "no hotspot" are excluded from new queries.
     let hotspotCapability = HotspotCapabilityMemory()
     let wifiMenu = WiFiMenuHotspot()
+    let batteryPublisher = GalaxyBatteryPublisher()
+    private var batteryPublishingSuspended = false
+    @Published var batteryWidgetEnabled = UserDefaults.standard.object(forKey: "battery.widget.enabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(batteryWidgetEnabled, forKey: "battery.widget.enabled")
+            synchronizeBatteryWidget()
+            if batteryWidgetEnabled { refreshHotspotInformation() }
+        }
+    }
+    func synchronizeBatteryWidget() {
+        guard #available(macOS 14.0, *) else { batteryPublisher.clear(); return }
+        guard batteryWidgetEnabled, !batteryPublishingSuspended, !AppVersion.isRenderingDemo, !AppVersion.isWindowSelfTest else { batteryPublisher.clear(); return }
+        let samples = (profile?.peers ?? []).compactMap { peer -> GalaxyBatterySample? in
+            guard let link = clipboardSession(for: peer.address), let address = link.peerAddress,
+                  let snapshot = hotspotCenter.informationSnapshot(address: address), let percent = snapshot.value.batteryPercent else { return nil }
+            return GalaxyBatterySample(address: address, name: peer.name, percent: percent, receivedAt: snapshot.receivedAt)
+        }
+        batteryPublisher.synchronize(samples)
+    }
+    var batteryWidgetStatus: String {
+        guard #available(macOS 14.0, *) else { return "Apple's Batteries widget requires macOS 14 or later." }
+        if let error = batteryPublisher.lastError { return error }
+        if !batteryWidgetEnabled { return "Galaxy battery sharing with macOS is off." }
+        if !batteryPublisher.available { return "The macOS accessory-battery interface is unavailable on this system." }
+        if batteryPublisher.publishedCount == 0 { return "Waiting for a connected Galaxy to report its battery." }
+        return "Sharing \(batteryPublisher.publishedCount) Galaxy battery reading(s) with macOS."
+    }
     @Published private(set) var hotspotInformationStates: [String: HotspotInformationQueryState] = [:]
     private var statusQueries: [String: Task<Void, Never>] = [:]
     private var statusQueryIDs: [String: UUID] = [:]
@@ -161,6 +191,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
                 let info = try await link.requestHotspotInformation()
                 guard self.statusQueryIDs[address] == id, self.clipboardSession(for: address) === link else { return }
                 self.hotspotCenter.storeInformation(address: address, value: info)
+                self.synchronizeBatteryWidget()
                 self.hotspotInformationStates[address] = nil
                 self.trace("Samsung status received: battery=\(info.batteryPercent.map(String.init) ?? "unknown")%.")
                 self.objectWillChange.send()
@@ -180,6 +211,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
         statusRetryAfter[address] = nil
         hotspotCapability.markAvailable(address)
         hotspotCenter.invalidate(address: address)
+        synchronizeBatteryWidget()
         if let link = clipboardSession(for: address) { refreshHotspotInformation(link) }
     }
     var homePeer: ContinuityProfile.Peer? {
@@ -350,6 +382,18 @@ enum HotspotInformationQueryState { case checking, unanswered }
                 connectBluetooth()
             }
         }
+        batteryPublisher.changed = { [weak self] in
+            guard let self else { return }
+            self.objectWillChange.send()
+            self.trace("macOS battery entries=\(self.batteryPublisher.publishedCount).")
+            if let error = self.batteryPublisher.lastError { self.trace(error) }
+        }
+        batteryPublisher.expired = { [weak self] addresses in
+            guard let self, self.batteryWidgetEnabled, !self.batteryPublishingSuspended else { return }
+            for address in addresses {
+                if let link = self.clipboardSession(for: address) { self.refreshHotspotInformation(link) }
+            }
+        }
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.automaticClipboard, self.hasClipboardLinks, self.lastChange != NSPasteboard.general.changeCount else { return }
@@ -373,6 +417,28 @@ enum HotspotInformationQueryState { case checking, unanswered }
     }
 
     private func installSystemObservers() {
+        if clockObserver == nil {
+            clockObserver = NotificationCenter.default.addObserver(forName: .NSSystemClockDidChange, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.statusQueryIDs.removeAll()
+                    for task in self.statusQueries.values { task.cancel() }; self.statusQueries.removeAll()
+                    self.statusRetryAfter.removeAll(); self.hotspotInformationStates.removeAll()
+                    self.hotspotCenter.invalidate(); self.batteryPublisher.clear()
+                    if !self.batteryPublishingSuspended { self.refreshHotspotInformation() }
+                }
+            }
+        }
+        if sleepObserver == nil {
+            sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.batteryPublishingSuspended = true; self?.batteryPublisher.clear() }
+            }
+        }
+        if terminationObserver == nil {
+            terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.batteryPublishingSuspended = true; self?.batteryPublisher.clear() }
+            }
+        }
         if wakeObserver == nil {
             wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didWakeNotification,
@@ -387,6 +453,8 @@ enum HotspotInformationQueryState { case checking, unanswered }
                     for task in self.statusQueries.values { task.cancel() }; self.statusQueries.removeAll()
                     self.statusRetryAfter.removeAll()
                     self.wifiMenu.invalidateCache()
+                    self.batteryPublisher.clear()
+                    self.batteryPublishingSuspended = false
                     self.refreshHotspotInformation()
                     self.reconnectAttempt = 0
                     self.lanPresence?.connectPCs()
@@ -761,6 +829,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
         addresses += nearbyClipboard.sessions.compactMap(\.peerAddress)
         clipboardPeerNames = addresses.compactMap { address in profile?.peers.first(where: { (try? ContinuityProfile.addressBytes($0.address)) == (try? ContinuityProfile.addressBytes(address)) })?.name }
         discovery.setConnectedPeers(addresses)
+        synchronizeBatteryWidget()
     }
 
     func disconnect() {
@@ -1473,6 +1542,17 @@ struct SettingsPageView: View {
             VStack(alignment: .leading, spacing: 20) {
                 OneUIPageHeader("Settings", subtitle: "Samsung account enrollment, smart connection preferences and diagnostics") {
                     OneUIStatusPill(AppVersion.full, tone: .active)
+                }
+
+                OneUICard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("Apple Batteries widget", systemImage: "battery.100percent").font(.headline)
+                        Toggle("Share Galaxy battery levels with macOS", isOn: $model.batteryWidgetEnabled)
+                            .help("Publishes authenticated, fresh battery readings as accessories. Turning this off removes the entries immediately.")
+                        Text(model.batteryWidgetStatus).font(.caption).foregroundStyle(.secondary)
+                        Text("Add Apple's Batteries widget to your desktop or Notification Center. Fresh readings from connected Galaxy devices are shared with macOS. Charging state is unavailable; no charging indicator is supplied.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 OneUICard {

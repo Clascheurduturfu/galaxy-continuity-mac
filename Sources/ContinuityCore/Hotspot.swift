@@ -87,8 +87,13 @@ public struct HotspotInformation: Decodable, Sendable {
     public static let informationWindow: TimeInterval = 300
     public init() {}
     public func information(address: String) -> HotspotInformation? {
-        guard let value = information[address], Date().timeIntervalSince(value.1) < Self.informationWindow else { return nil }
-        return value.0
+        informationSnapshot(address: address)?.value
+    }
+    public func informationSnapshot(address: String) -> (value: HotspotInformation, receivedAt: Date)? {
+        guard let value = information[address] else { return nil }
+        let age = Date().timeIntervalSince(value.1)
+        guard age >= 0, age < Self.informationWindow else { return nil }
+        return (value.0, value.1)
     }
     public func storeInformation(address: String, value: HotspotInformation) { information[address] = (value, Date()) }
     /// A still-fresh answer for the device, or nil when it must be re-requested.

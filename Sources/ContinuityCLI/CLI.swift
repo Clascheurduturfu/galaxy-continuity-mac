@@ -244,7 +244,7 @@ import ContinuityCore
                 }
                 RunLoop.main.run(); return
             }
-            print("continuity v1.1-beta.5\n  scan [--seconds 12] [--profile-stdin]\n  probe HOST PORT [--profile-stdin]\n  import-profile --profile-stdin\nProfiles are read from stdin or Keychain; never put keys in arguments.")
+            print("continuity v1.1-rc.1\n  scan [--seconds 12] [--profile-stdin]\n  probe HOST PORT [--profile-stdin]\n  import-profile --profile-stdin\nProfiles are read from stdin or Keychain; never put keys in arguments.")
         } catch {
             let message = error.localizedDescription + "\n"; fputs(message, stderr)
             if let i = args.firstIndex(of: "--output"), i + 1 < args.count { try? message.write(toFile: args[i + 1], atomically: true, encoding: .utf8) }

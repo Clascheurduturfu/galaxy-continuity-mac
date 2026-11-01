@@ -1,5 +1,28 @@
 # Auto Hotspot: native macOS Wi-Fi menu integration
 
+## RC3 join repair (2026-11-01)
+
+The installed RC2 hook log confirmed activation followed by "hotspot ssid
+not found in scan". Unlike the retained original v4 proof of concept, RC2
+only scanned once. RC3 restores twelve bounded attempts spaced 1.5 seconds
+apart and moves scanning/association into the main app, which owns Location
+permission. The menu waits for the actual join result rather than treating
+phone activation as a completed Wi-Fi connection. The menu/app IPC now carries
+only UUID-correlated requests and results, without Wi-Fi passwords. A file lock
+serializes clicks across both agents and late replies cannot complete a new click.
+
+The app's current-SSID observation controls placeholder visibility. Existing
+cached fake objects are filtered too, and the menu requests a refresh after a
+successful join. The real SSID takes over while connected; no SSID is renamed.
+Radio sessions and the phone's hotspot settings are unchanged. Native fixture
+tests exercise cache filtering, concurrent clicks and mismatched replies without
+activating tethering or changing the test machine's Wi-Fi network.
+
+The owner's additional client-connection-limit message was not reproduced in
+this run. Closed BLE transports now release their central manager and delegates,
+and a Bluetooth-specific limit error gives a scoped recovery instruction. This
+does not establish that Bluetooth produced that original screenshot's message.
+
 Status: Beta 5, 2026-10-28 (Beta 3 repairs, query lifecycle and battery UI corrections). The private research checkout retains both
 `AUTO_HOTSPOT_RESEARCH.md` and the original v4 Objective-C source. They were
 not lost; temporary copies disappearing from `/tmp` did not remove these files.

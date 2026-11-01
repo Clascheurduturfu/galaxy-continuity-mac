@@ -139,6 +139,9 @@ public enum MCFAdvertisement {
         channel?.inputStream.close(); channel?.outputStream.close()
         channel?.inputStream.remove(from: .main, forMode: .common); channel?.outputStream.remove(from: .main, forMode: .common)
         if let peripheral { manager?.cancelPeripheralConnection(peripheral) }
+        channel?.inputStream.delegate = nil; channel?.outputStream.delegate = nil
+        peripheral?.delegate = nil
+        peripheral = nil; manager?.delegate = nil; manager = nil
         let c = connecting; connecting = nil; c?.resume(throwing: error)
         let r = receiving; receiving = nil; r?.resume(throwing: error)
         let s = sending; sending = nil; s?.resume(throwing: error)
@@ -169,7 +172,11 @@ public enum MCFAdvertisement {
         status?("Samsung account candidate found; connecting to BLE CoC PSM \(psm)…"); central.connect(peripheral)
     }
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) { status?("BLE connected; opening the continuity channel…"); peripheral.openL2CAPChannel(psm) }
-    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) { finish(error ?? ContinuityError.message("BLE connection failed.")) }
+    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        if let error = error as NSError?, error.domain == CBErrorDomain, error.code == CBError.connectionLimitReached.rawValue {
+            finish(ContinuityError.message("macOS reached its Bluetooth connection limit. Pause Device Connections, then resume to release and reopen the Galaxy sessions."))
+        } else { finish(error ?? ContinuityError.message("BLE connection failed.")) }
+    }
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) { finish(error ?? ContinuityError.message("The Samsung device disconnected.")) }
     public func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         guard let channel, error == nil else { finish(error ?? ContinuityError.message("The Samsung BLE CoC channel did not open.")); return }

@@ -2,13 +2,14 @@ import SwiftUI
 import AppKit
 import ContinuityCore
 import Darwin
+import CoreWLAN
 
 /// Native macOS Wi-Fi menu integration (experimental; requires SIP disabled).
 ///
 /// A hook dylib injected into WiFiAgent/ControlCenter shows the connected
 /// Galaxy under "Personal Hotspots"; clicking it asks this app — through the
 /// file protocol below — to request the phone's hotspot over the EXISTING
-/// BLE session and hand back credentials the hook joins with.
+/// BLE session. The app joins Wi-Fi and returns only a correlated result.
 ///
 /// File protocol in `/tmp/gcl-wifi-menu` (all files created by whichever side
 /// owns them; the hook only reads/writes what the notes describe):
@@ -16,8 +17,8 @@ import Darwin
 /// - `available`    app → hook: touched while a live session + hotspot-capable
 ///                   device exists; the hook hides the entry when stale (>10 s)
 /// - `menu_opened`  hook → app: the Wi-Fi menu opened → prefetch, rate-limited
-/// - `trigger`      hook → app: the entry was clicked → answer with creds.json
-/// - `creds.json`   app → hook: {isSuccess, ssid, password, reason}
+/// - `trigger`      hook → app: {id: UUID}; one click across both agents
+/// - `creds.json`   app → hook: {id, joined, message}; no credentials
 @MainActor final class WiFiMenuHotspot: ObservableObject {
     nonisolated static let directory = URL(fileURLWithPath: "/tmp/gcl-wifi-menu")
     nonisolated static let statusFile = WiFiMenuHotspot.directory.appendingPathComponent("status.json")
@@ -39,6 +40,8 @@ import Darwin
     @Published var status = "Not set up."
     private var loop: Task<Void, Never>?
     private var handling = false
+    private let joiner = HotspotJoiner()
+    private var joinOperation: Task<Void, Never>?
     @Published private(set) var installing = false
     private var installation: Task<Void, Never>?
     /// Wired by LabModel: the live session and the device it targets.
@@ -87,6 +90,7 @@ import Darwin
         loop?.cancel(); loop = nil
         let requested = enabled
         if !requested {
+            joinOperation?.cancel()
             removeFile(Self.availableFile); removeFile(Self.menuOpenedFile); removeFile(Self.triggerFile); removeFile(Self.credsFile)
         } else {
             refreshSIP()
@@ -133,7 +137,10 @@ import Darwin
         publishAvailability(tick: tick)
         guard !handling else { return }
         if FileManager.default.fileExists(atPath: Self.menuOpenedFile.path) { removeFile(Self.menuOpenedFile) ; await prefetch() }
-        if FileManager.default.fileExists(atPath: Self.triggerFile.path) { await handleTrigger() }
+        if FileManager.default.fileExists(atPath: Self.triggerFile.path) {
+            handling = true
+            joinOperation = Task { await handleTrigger() }
+        }
     }
 
     // MARK: availability
@@ -150,7 +157,8 @@ import Darwin
         }
         let payload: [String: Any] = [
             "name": live.name, "battery": center?.information(address: live.address)?.batteryPercent ?? -1,
-            "ssid": center?.lastSSID(address: live.address) ?? ""
+            "ssid": center?.lastSSID(address: live.address) ?? "",
+            "connected": center?.lastSSID(address: live.address).map { CWWiFiClient.shared().interface()?.ssid() == $0 } ?? false
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.statusFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statusFile.path) }
         FileManager.default.createFile(atPath: Self.availableFile.path, contents: nil, attributes: [.modificationDate: Date(), .posixPermissions: 0o600])
@@ -174,22 +182,30 @@ import Darwin
     /// The entry was clicked: reuse a fresh cached answer, else ask once over
     /// the existing session, then hand the credentials to the hook.
     private func handleTrigger() async {
-        handling = true
-        defer { handling = false; removeFile(Self.triggerFile) }
-        guard let live = liveSession?(), let center, let capability else { writeCreds(nil, reason: -1); return }
+        defer { handling = false; joinOperation = nil; removeFile(Self.triggerFile) }
+        guard let data = try? Data(contentsOf: Self.triggerFile),
+              let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = request["id"] as? String, UUID(uuidString: id) != nil else { return }
+        guard let live = liveSession?(), let center, let capability else { writeResult(id: id, joined: false, message: "No authenticated Galaxy session is available."); return }
         var answer = center.cached(address: live.address)
         if answer == nil { answer = try? await live.session.requestHotspotAnswer(timeout: 15) }
-        guard let answer else { writeCreds(nil, reason: -1); return }
+        guard let answer else { writeResult(id: id, joined: false, message: "The phone did not answer the hotspot request."); return }
         center.store(address: live.address, credentials: answer)
         if answer.isSuccess == true { capability.markAvailable(live.address) } else { capability.markUnavailable(live.address, reason: answer.mhsfailed_reason) }
-        writeCreds(answer)
+        do {
+            guard enabled else { throw CancellationError() }
+            try await joiner.join(answer)
+            publishAvailability(tick: 0)
+            writeResult(id: id, joined: true)
+            note?("Connected to the Galaxy hotspot from the Wi-Fi menu.")
+        } catch {
+            writeResult(id: id, joined: false, message: error.localizedDescription)
+            note?("Wi-Fi menu connection: " + error.localizedDescription)
+        }
     }
-    private func writeCreds(_ answer: HotspotCredentials?, reason: Int = -1) {
+    private func writeResult(id: String, joined: Bool, message: String = "") {
         let payload: [String: Any] = [
-            "isSuccess": answer?.isSuccess == true,
-            "ssid": answer?.ssid ?? "",
-            "password": answer?.password ?? "",
-            "reason": answer?.mhsfailed_reason ?? reason
+            "id": id, "joined": joined, "message": message
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.credsFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.credsFile.path) }
     }
@@ -206,7 +222,7 @@ import Darwin
         guard (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == getuid(), chmod(directory.path, 0o700) == 0 else {
             throw ContinuityError.message("Wi-Fi menu storage is not an owned directory.")
         }
-        for name in ["status.json", "available", "menu_opened", "trigger", "creds.json", "hook.log"] {
+        for name in ["status.json", "available", "menu_opened", "trigger", "trigger.pending", "join.lock", "creds.json", "hook.log"] {
             let path = directory.appendingPathComponent(name).path
             if lstat(path, &info) == 0 {
                 guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(), info.st_nlink == 1 else { throw ContinuityError.message("Unexpected Wi-Fi menu storage entry.") }

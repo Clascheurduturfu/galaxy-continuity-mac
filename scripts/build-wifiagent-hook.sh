@@ -12,4 +12,8 @@ clang "${arches[@]}" -dynamiclib -mmacosx-version-min=13.0 -O2 -fobjc-arc -Wall 
   -o dist/GalaxyContinuityWiFiMenuHook.dylib \
   scripts/wifiagent-hook/GalaxyContinuityWiFiMenuHook.m
 codesign --force --sign - dist/GalaxyContinuityWiFiMenuHook.dylib
+mkdir -p .build
+clang -mmacosx-version-min=13.0 -O2 -fobjc-arc -Wall -framework Foundation -framework CoreWLAN \
+  -o .build/wifi-menu-hook-tests scripts/wifiagent-hook/test.m
+.build/wifi-menu-hook-tests
 cp dist/GalaxyContinuityWiFiMenuHook.dylib "dist/Galaxy Continuity Lab.app/Contents/Resources/"

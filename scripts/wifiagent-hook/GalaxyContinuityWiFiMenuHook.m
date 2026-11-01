@@ -1,4 +1,4 @@
-// GalaxyContinuityWiFiMenuHook.m — v6
+// GalaxyContinuityWiFiMenuHook.m — v7
 //
 // Shows the user's Samsung Galaxy under the native macOS Wi-Fi menu's
 // "Personal Hotspots" section and joins it when clicked. Loaded through
@@ -9,8 +9,8 @@
 //   status.json  app -> hook: {name, battery, bars, network, ssid}
 //   available    app -> hook: touched while the phone session is live
 //   menu_opened  hook -> app: the Wi-Fi menu was opened (app may prefetch)
-//   trigger      hook -> app: the entry was clicked; answered via creds.json
-//   creds.json   app -> hook: {isSuccess, ssid, password, reason}
+//   trigger      hook -> app: {id: UUID}; the app activates and joins Wi-Fi
+//   creds.json   app -> hook: {id, joined, message}; no credentials
 //   hook.log     hook: diagnostics, one line per interesting event
 //
 // Everything resolves classes and selectors at runtime and no-ops when they
@@ -27,10 +27,17 @@
 #import <time.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <sys/file.h>
 
 #pragma mark - Files and logging
 
-static NSString *GCLDir(void) { return @"/tmp/gcl-wifi-menu"; }
+static NSString *GCLDir(void) {
+#ifdef GCL_TESTING
+    return [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:[NSString stringWithFormat:@".build/hook-fixture-%d", getpid()]];
+#else
+    return @"/tmp/gcl-wifi-menu";
+#endif
+}
 
 // Validate the owner-only IPC directory and use openat/O_NOFOLLOW for every file.
 static int GCLDirectoryFD(void) {
@@ -100,20 +107,10 @@ static GCLStatus GCLLoadStatus(void) {
 /// connected, the fake entry is suppressed so it does not duplicate the
 /// joined network in the menu).
 static BOOL GCLConnectedToHotspot(void) {
-    GCLStatus st = GCLLoadStatus();
-    if (!st.ok || st.ssid.length == 0) return NO;
-    Class wifiClient = NSClassFromString(@"CWWiFiClient");
-    id client = nil, interface = nil;
-    if (wifiClient) {
-        SEL factories[3] = {@selector(sharedClient), @selector(sharedWiFiClient), @selector(shared)};
-        for (int i = 0; i < 3 && !client; i++) {
-            if ([wifiClient respondsToSelector:factories[i]]) client = ((id (*)(id, SEL)) objc_msgSend)(wifiClient, factories[i]);
-        }
-    }
-    if ([client respondsToSelector:@selector(interface)]) interface = ((id (*)(id, SEL)) objc_msgSend)(client, @selector(interface));
-    if (!interface) return NO;
-    NSString *current = ((NSString *(*)(id, SEL)) objc_msgSend)(interface, @selector(ssid));
-    return [current isEqualToString:st.ssid];
+    // Read the app's permission-aware observation; never create CoreWLAN
+    // clients inside the system menu agents just to render a row.
+    if (!GCLAvailableFresh()) return NO;
+    return [GCLReadJSON(@"status.json")[@"connected"] boolValue];
 }
 
 static NSString *GCLFakeAddress(void) { return @"AA:BB:CC:DD:EE:FF"; }
@@ -178,7 +175,9 @@ static void GCLSwap(Class cls, SEL selector, IMP implementation, IMP *original) 
 #pragma mark - CWWiFiAgent hooks
 
 static IMP gcl_orig_startBrowsing;
+static __weak id gcl_agent;
 static void gcl_hook_startBrowsing(id self, SEL _cmd, id reply) {
+    gcl_agent = self;
     GCLLog(@"tether browsing started");
     GCLTouch(@"menu_opened");   // the app may prefetch a fresh hotspot answer
     if (gcl_orig_startBrowsing) ((void (*)(id, SEL, id)) gcl_orig_startBrowsing)(self, _cmd, reply);
@@ -186,6 +185,7 @@ static void gcl_hook_startBrowsing(id self, SEL _cmd, id reply) {
 
 static IMP gcl_orig_updatedFoundDevices;
 static void gcl_hook_updatedFoundDevices(id self, SEL _cmd, id session, NSArray *devices) {
+    devices = [devices filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id device, NSDictionary *bindings) { return !GCLIsOurDevice(device); }]];
     GCLStatus st = GCLLoadStatus();
     if (st.ok && !GCLConnectedToHotspot()) {
         id fake = GCLMakeFakeRemoteDevice(st);
@@ -197,6 +197,11 @@ static void gcl_hook_updatedFoundDevices(id self, SEL _cmd, id session, NSArray 
 static IMP gcl_orig_cachedTetherDevices, gcl_orig_cachedCurrent;
 static id GCLCached(id self, SEL cmd, IMP originalIMP) {
     id original = originalIMP ? ((id (*)(id, SEL))originalIMP)(self, cmd) : nil;
+    // The original cache may already contain an injected row from a previous
+    // browse callback. Remove it before applying current visibility, too.
+    NSPredicate *stockOnly = [NSPredicate predicateWithBlock:^BOOL(id device, NSDictionary *bindings) { return !GCLIsOurDevice(device); }];
+    if ([original isKindOfClass:NSSet.class]) original = [original filteredSetUsingPredicate:stockOnly];
+    else if ([original isKindOfClass:NSArray.class]) original = [original filteredArrayUsingPredicate:stockOnly];
     GCLStatus st = GCLLoadStatus();
     if (!st.ok || GCLConnectedToHotspot()) return original;
     id fake = GCLMakeFakeRemoteDevice(st);
@@ -227,37 +232,51 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
     }
     GCLLog(@"our tether device clicked: joining via the app");
     if ([NSThread isMainThread]) { if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:5 userInfo:@{NSLocalizedDescriptionKey: @"Use Connect in Galaxy Continuity for this macOS menu path."}]; return NO; }
-    GCLRemove(@"creds.json");
-    GCLTouch(@"trigger");
-    NSDictionary *creds = nil;
-    for (int i = 0; i < 100 && !creds; i++) { usleep(100000); creds = GCLReadJSON(@"creds.json"); }
-    if (!creds) { GCLLog(@"no creds.json within 10 s"); if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:1 userInfo:@{NSLocalizedDescriptionKey: @"The phone did not answer in time."}]; return NO; }
-    GCLRemove(@"creds.json");
-    if (![creds[@"isSuccess"] boolValue]) {
-        GCLLog(@"creds report failure reason %@", creds[@"reason"]);
-        if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:2 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"The phone declined the hotspot request (reason %@).", creds[@"reason"] ?: @"?"]}];
+    // Serialize clicks across both injected processes. A per-request UUID
+    // prevents a late reply from satisfying another click.
+    int lock = GCLOpen(@"join.lock", O_CREAT | O_RDWR);
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0) {
+        if (lock >= 0) close(lock);
+        if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:6 userInfo:@{NSLocalizedDescriptionKey: @"A Galaxy hotspot connection is already in progress."}];
         return NO;
     }
-    NSString *ssid = creds[@"ssid"], *password = creds[@"password"];
-    GCLRemove(@"creds.json");
-    if (![ssid isKindOfClass:[NSString class]] || !ssid.length || ![password isKindOfClass:[NSString class]]) return NO;
-    NSData *ssidData = [ssid dataUsingEncoding:NSUTF8StringEncoding];
-    NSArray *networks = nil;
-    if ([self respondsToSelector:@selector(scanForNetworksWithSSID:error:)]) {
-        networks = ((NSArray *(*)(id, SEL, NSData *, NSError **)) objc_msgSend)(self, @selector(scanForNetworksWithSSID:error:), ssidData, NULL);
-    } else if ([self respondsToSelector:@selector(scanForNetworksForSSID:error:)]) {
-        networks = ((NSArray *(*)(id, SEL, NSData *, NSError **)) objc_msgSend)(self, @selector(scanForNetworksForSSID:error:), ssidData, NULL);
-    } else if ([self respondsToSelector:@selector(scanForNetworksWithError:)]) {
-        NSArray *all = ((NSArray *(*)(id, SEL, NSError **)) objc_msgSend)(self, @selector(scanForNetworksWithError:), NULL);
-        networks = [all filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"ssid == %@", ssid]];
-    } else {
-        GCLLog(@"no scan selector available on CWInterface");
-        if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:4 userInfo:@{NSLocalizedDescriptionKey: @"Could not scan for the hotspot."}];
-        return NO;
+    NSString *requestID = [NSUUID UUID].UUIDString;
+    NSData *request = [NSJSONSerialization dataWithJSONObject:@{@"id": requestID} options:0 error:NULL];
+    int fd = GCLOpen(@"trigger.pending", O_CREAT | O_WRONLY | O_TRUNC);
+    BOOL wrote = fd >= 0 && write(fd, request.bytes, request.length) == (ssize_t)request.length;
+    if (fd >= 0) close(fd);
+    int directory = GCLDirectoryFD();
+    BOOL published = wrote && directory >= 0 && renameat(directory, "trigger.pending", directory, "trigger") == 0;
+    if (directory >= 0) close(directory);
+    NSDictionary *result = nil;
+    // The app owns Location permission and retries scans while the AP starts.
+    // No passwords cross this IPC and the menu never starts a second join.
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 65;
+    while (published && NSProcessInfo.processInfo.systemUptime < deadline) {
+        NSDictionary *candidate = GCLReadJSON(@"creds.json");
+        if ([candidate[@"id"] isEqual:requestID]) { result = candidate; break; }
+        usleep(100000);
     }
-    if (networks.count == 0) { GCLLog(@"hotspot ssid not found in scan"); if (error) *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:3 userInfo:@{NSLocalizedDescriptionKey: @"The phone's hotspot was not visible yet."}]; return NO; }
-    BOOL ok = ((BOOL (*)(id, SEL, id, id, NSError **)) objc_msgSend)(self, @selector(associateToNetwork:password:error:), networks.firstObject, password, error);
-    GCLLog(@"hotspot association ok=%d", ok);
+    if (result) GCLRemove(@"creds.json");
+    BOOL ok = [result[@"joined"] boolValue];
+    if (!ok && error) {
+        NSString *message = [result[@"message"] isKindOfClass:NSString.class] ? result[@"message"] : @"Galaxy hotspot connection timed out. Check Galaxy Continuity for details.";
+        *error = [NSError errorWithDomain:@"GalaxyContinuityWiFiMenu" code:7 userInfo:@{NSLocalizedDescriptionKey: message}];
+    }
+    flock(lock, LOCK_UN); close(lock);
+    GCLLog(@"app hotspot association ok=%d", ok);
+    if (ok) dispatch_async(dispatch_get_main_queue(), ^{
+        id agent = gcl_agent;
+        // Rebuild from the filtered caches after the real Wi-Fi join; this
+        // drops an already-visible placeholder without reopening the menu.
+        for (NSString *name in @[@"__updateUIState", @"postDisplayedScanResults"]) {
+            SEL selector = NSSelectorFromString(name);
+            if ([agent respondsToSelector:selector]) {
+                @try { ((void (*)(id, SEL))objc_msgSend)(agent, selector); }
+                @catch (NSException *exception) { GCLLog(@"menu refresh unavailable"); }
+            }
+        }
+    });
     return ok;
 }
 

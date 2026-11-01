@@ -20,14 +20,14 @@ import CoreLocation
         guard manager.authorizationStatus == .authorizedAlways else {
             throw ContinuityError.message("Allow Galaxy Continuity Lab in System Settings → Privacy & Security → Location Services so macOS can find the phone's Wi-Fi network.")
         }
-        for attempt in 0..<4 {
+        for attempt in 0..<12 {
             try Task.checkCancellation()
             do { try await Task.detached { try credentials.join() }.value; return }
             catch {
                 if Task.isCancelled { throw CancellationError() }
-                if attempt == 3 { throw error }
+                if attempt == 11 { throw error }
                 progress?("Waiting for the phone's hotspot to become visible…")
-                try await Task.sleep(nanoseconds: 2_000_000_000)
+                try await Task.sleep(nanoseconds: 1_500_000_000)
             }
         }
     }

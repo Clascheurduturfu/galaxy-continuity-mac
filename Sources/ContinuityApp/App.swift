@@ -325,6 +325,7 @@ enum HotspotInformationQueryState { case checking, unanswered }
         wifiMenu.center = hotspotCenter
         wifiMenu.capability = hotspotCapability
         wifiMenu.note = { [weak self] in self?.note($0) }
+        wifiMenu.requestReconnect = { [weak self] in self?.triggerSmartConnect(reason: "Wi-Fi menu hotspot request") }
         wifiMenu.liveSession = { [weak self] in
             guard let self else { return nil }
             let peers = (self.profile?.peers ?? []).sorted { ($0.deviceType == "phone" ? 0 : 1) < ($1.deviceType == "phone" ? 0 : 1) }
@@ -338,6 +339,13 @@ enum HotspotInformationQueryState { case checking, unanswered }
             return nil
         }
         wifiMenu.start()
+        PhoneAppBridge.shared.deviceNameProvider = { [weak self] in
+            self?.homePeer?.name ?? self?.activePeer?.name ?? self?.targetDisplayName ?? "Galaxy Phone"
+        }
+        PhoneAppBridge.shared.note = { [weak self] in self?.note($0) }
+        PhoneAppBridge.shared.start()
+        CallingController.shared.contactNameLookup = { ContactsStore.shared.name(forPhoneNumber: $0) }
+        ContactsStore.shared.refreshIfAuthorized()
         installSystemObservers()
 
         let args = CommandLine.arguments
@@ -461,16 +469,33 @@ enum HotspotInformationQueryState { case checking, unanswered }
                     if self.autoConnect, !self.userPaused, !self.connected, !self.busy {
                         self.scheduleReconnect(immediate: true)
                     }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    CallingController.shared.recoverAfterSystemEvent(.wake)
                 }
             }
         }
         if pathMonitor == nil {
             let monitor = NWPathMonitor()
             monitor.pathUpdateHandler = { [weak self] path in
-                guard path.status == .satisfied else { return }
+                let signature: String
+                if path.status == .satisfied {
+                    signature = path.availableInterfaces
+                        .map { "\($0.name):\($0.type)" }
+                        .sorted()
+                        .joined(separator: ",")
+                } else {
+                    signature = ""
+                }
                 Task { @MainActor in
                     guard let self else { return }
-                    self.lanPresence?.connectPCs()
+                    if path.status == .satisfied {
+                        self.lanPresence?.connectPCs()
+                        if !signature.isEmpty {
+                            CallingController.shared.recoverAfterSystemEvent(.networkReady(signature: signature))
+                        }
+                    } else {
+                        CallingController.shared.recoverAfterSystemEvent(.networkUnavailable)
+                    }
                 }
             }
             monitor.start(queue: DispatchQueue(label: "continuity.network.monitor"))
@@ -897,6 +922,26 @@ enum HotspotInformationQueryState { case checking, unanswered }
         } catch { status = error.localizedDescription }
     }
 
+    @Published var callingDiagnosticStatus = "Samsung Call & Text on Other Devices (CMC) registers this Mac over Wi-Fi and the Internet."
+    @Published var checkingCallingDiagnostics = false
+
+    func checkCallingDiagnostics(transport: Bool = false) {
+        guard !checkingCallingDiagnostics else { return }
+        checkingCallingDiagnostics = true
+        Task {
+            defer { checkingCallingDiagnostics = false }
+            do {
+                if transport {
+                    callingDiagnosticStatus = try await ContinuitySignIn.shared.checkCallingTransport(status: { self.callingDiagnosticStatus = $0 })
+                } else {
+                    callingDiagnosticStatus = try await ContinuitySignIn.shared.checkCallingAccount(status: { self.callingDiagnosticStatus = $0 })
+                }
+            } catch {
+                callingDiagnosticStatus = error.localizedDescription
+            }
+        }
+    }
+
     func probe(_ device: ContinuityDevice) {
         guard let profile, !busy, let port = UInt16(exactly: device.port) else { return }
         busy = true; status = "Verifying the Samsung account handshake…"
@@ -909,14 +954,11 @@ enum HotspotInformationQueryState { case checking, unanswered }
 }
 
 struct LabView: View {
-    @Environment(\.colorScheme) private var scheme
-    @ObservedObject var model: LabModel
-    @ObservedObject var buds: BudsModel
-    @ObservedObject var features: FeaturesModel
-    @ObservedObject var hotspots: HotspotsModel
+    let model: LabModel
+    let buds: BudsModel
+    let features: FeaturesModel
+    let hotspots: HotspotsModel
     @Environment(\.openWindow) private var openWindow
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @ObservedObject private var calls = CallingController.shared
     @State var selectedSection: SidebarSection = {
         let args = CommandLine.arguments
         if args.contains("--buds-probe") { return .buds }
@@ -926,77 +968,29 @@ struct LabView: View {
     @State private var importing = false
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 10) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .fill(LinearGradient(colors: [OneUI.blue, OneUI.deepBlue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .frame(width: 34, height: 34)
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(AppVersion.appName)
-                            .font(.system(size: 14, weight: .bold, design: .rounded))
-                        Text(AppVersion.display)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-
+        NavigationSplitView {
+            VStack(spacing: 0) {
+                SidebarBrandHeader()
                 List(SidebarSection.allCases, selection: $selectedSection) { section in
-                    Label { Text(section.rawValue) } icon: {
-                        Image(systemName: section.symbol).foregroundStyle(selectedSection == section ? (scheme == .dark ? Color.white : OneUI.blue) : Color.secondary)
-                    }
-                        .font(.system(size: 13, weight: .medium))
+                    SidebarSectionRow(section: section, isSelected: selectedSection == section)
                         .tag(section)
                 }
                 .listStyle(.sidebar)
-
-                Spacer()
-
-                SidebarStatusFooter(model: model, calls: calls, buds: buds)
+                SidebarStatusFooter(model: model, calls: CallingController.shared, buds: buds)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 12)
             }
             .navigationSplitViewColumnWidth(min: 205, ideal: 220, max: 250)
         } detail: {
-            ZStack {
-                OneUI.canvasBackground(scheme)
-                    .ignoresSafeArea()
-
-                switch selectedSection {
-                case .home:
-                    HomePageView(
-                        model: model,
-                        buds: buds,
-                        features: features,
-                        calls: calls,
-                        selectedSection: $selectedSection
-                    )
-                case .clipboard:
-                    ClipboardPageView(model: model)
-                case .calls:
-                    CallsPanel()
-                case .buds:
-                    BudsPanel(model: buds)
-                case .nearby:
-                    NearbyDevicesPage(model: model, features: features, section: $selectedSection)
-                case .multiControl:
-                    MultiControlPage(model: model, features: features)
-                case .hotspots:
-                    HotspotsPage(model: model, hotspots: hotspots)
-                case .settings:
-                    SettingsPageView(model: model, features: features, importing: $importing)
-                }
-            }
+            LabDetailHost(
+                model: model,
+                buds: buds,
+                features: features,
+                hotspots: hotspots,
+                selectedSection: $selectedSection,
+                importing: $importing
+            )
         }
-        .navigationSplitViewStyle(.balanced)
-        .background(MainWindowAttachment())
         .frame(minWidth: 900, minHeight: 640)
         .onAppear {
             guard !AppVersion.isRenderingDemo else { return }
@@ -1006,6 +1000,89 @@ struct LabView: View {
             AppWindowPolicy.shared.displayedSection = selectedSection
         }
         .onChange(of: selectedSection) { AppWindowPolicy.shared.displayedSection = $0 }
+    }
+}
+
+private struct SidebarBrandHeader: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(LinearGradient(colors: [OneUI.blue, OneUI.deepBlue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 34, height: 34)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(AppVersion.appName)
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                Text(AppVersion.display)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
+    }
+}
+
+private struct SidebarSectionRow: View {
+    @Environment(\.colorScheme) private var scheme
+    let section: SidebarSection
+    let isSelected: Bool
+
+    var body: some View {
+        Label { Text(section.rawValue) } icon: {
+            Image(systemName: section.symbol)
+                .foregroundStyle(isSelected ? (scheme == .dark ? Color.white : OneUI.blue) : Color.secondary)
+        }
+        .font(.system(size: 13, weight: .medium))
+    }
+}
+
+private struct LabDetailHost: View {
+    @Environment(\.colorScheme) private var scheme
+    @ObservedObject var model: LabModel
+    let buds: BudsModel
+    let features: FeaturesModel
+    let hotspots: HotspotsModel
+    @Binding var selectedSection: SidebarSection
+    @Binding var importing: Bool
+
+    var body: some View {
+        ZStack {
+            OneUI.canvasBackground(scheme)
+                .ignoresSafeArea()
+
+            switch selectedSection {
+            case .home:
+                HomePageView(
+                    model: model,
+                    buds: buds,
+                    features: features,
+                    calls: CallingController.shared,
+                    selectedSection: $selectedSection
+                )
+            case .clipboard:
+                ClipboardPageView(model: model)
+            case .calls:
+                CallsPanel()
+            case .buds:
+                BudsPanel(model: buds)
+            case .nearby:
+                NearbyDevicesPage(model: model, features: features, section: $selectedSection)
+            case .multiControl:
+                MultiControlPage(model: model, features: features)
+            case .hotspots:
+                HotspotsPage(model: model, hotspots: hotspots)
+            case .settings:
+                SettingsPageView(model: model, features: features, importing: $importing)
+            }
+        }
+        .background(MainWindowAttachment())
         .onChange(of: model.connected) { isConnected in
             features.sharedCommand = isConnected ? model.session : nil
             features.sharedCommandPeerAddress = isConnected ? model.selectedTarget : nil
@@ -1190,6 +1267,7 @@ struct HomePageView: View {
                     RecentClipboardCard(model: model, selectedSection: $selectedSection)
                     NearbyEcosystemCard(model: model)
                 }
+                .fixedSize(horizontal: false, vertical: true)
             }
             .padding(28)
         }
@@ -1339,7 +1417,7 @@ private struct RecentClipboardCard: View {
     @Binding var selectedSection: SidebarSection
 
     var body: some View {
-        OneUICard {
+        OneUICard(fillHeight: true) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Label("Clipboard Continuity", systemImage: "doc.on.clipboard")
@@ -1400,7 +1478,7 @@ private struct NearbyEcosystemCard: View {
     @ObservedObject var model: LabModel
 
     var body: some View {
-        OneUICard {
+        OneUICard(fillHeight: true) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Label("Nearby Devices", systemImage: "dot.radiowaves.left.and.right")
@@ -1545,17 +1623,6 @@ struct SettingsPageView: View {
                 }
 
                 OneUICard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("Apple Batteries widget", systemImage: "battery.100percent").font(.headline)
-                        Toggle("Share Galaxy battery levels with macOS", isOn: $model.batteryWidgetEnabled)
-                            .help("Publishes authenticated, fresh battery readings as accessories. Turning this off removes the entries immediately.")
-                        Text(model.batteryWidgetStatus).font(.caption).foregroundStyle(.secondary)
-                        Text("Add Apple's Batteries widget to your desktop or Notification Center. Fresh readings from connected Galaxy devices are shared with macOS. Charging state is unavailable; no charging indicator is supplied.")
-                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-
-                OneUICard {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack(spacing: 14) {
                             ZStack {
@@ -1633,6 +1700,41 @@ struct SettingsPageView: View {
                 UpdatesCard(canInstall: !features.multi.controlling && !features.busy && features.storage.mountURL == nil)
 
                 OneUICard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("Apple Batteries widget", systemImage: "battery.100percent").font(.headline)
+                        Toggle("Share Galaxy battery levels with macOS", isOn: $model.batteryWidgetEnabled)
+                            .toggleStyle(OneUIAlignedSwitchStyle())
+                            .help("Publishes authenticated, fresh battery readings as accessories. Turning this off removes the entries immediately.")
+                        Text(model.batteryWidgetStatus).font(.caption).foregroundStyle(.secondary)
+                        Text("Add Apple's Batteries widget to your desktop or Notification Center. Fresh readings from connected Galaxy devices are shared with macOS. Charging state is unavailable; no charging indicator is supplied.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                OneUICard {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Label("SIP Features", systemImage: "lock.shield")
+                                .font(.system(size: 16, weight: .bold, design: .rounded))
+                            Spacer()
+                            Button("Check SIP") {
+                                PhoneAppBridge.shared.refreshSIP()
+                                model.wifiMenu.refreshSIP()
+                            }
+                            .buttonStyle(OneUISecondaryButtonStyle())
+                        }
+                        Text("Optional system integrations that require System Integrity Protection (SIP) to be disabled on this Mac.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Divider()
+                        PhoneAppIntegrationSection(bridge: PhoneAppBridge.shared)
+                        Divider()
+                        WiFiMenuHotspotSection(wifiMenu: model.wifiMenu)
+                    }
+                }
+
+                OneUICard {
                     DisclosureGroup("Advanced & Migration Tools", isExpanded: $showAdvanced) {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Credentials are stored in \(ContinuityLoginStorage.description).")
@@ -1652,6 +1754,35 @@ struct SettingsPageView: View {
                                     .buttonStyle(OneUISecondaryButtonStyle())
                                     .disabled(model.signingIn || model.busy)
                                 }
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Diagnosis")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("The Mac and phone can use different Internet connections. Samsung Call & text on other devices must be enabled on the phone.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                HStack(spacing: 10) {
+                                    Button(model.checkingCallingDiagnostics ? "Checking…" : "Check Calling Account") {
+                                        model.checkCallingDiagnostics()
+                                    }
+                                    .buttonStyle(OneUISecondaryButtonStyle())
+                                    .disabled(model.checkingCallingDiagnostics)
+
+                                    Button("Check Calling Server") {
+                                        model.checkCallingDiagnostics(transport: true)
+                                    }
+                                    .buttonStyle(OneUISecondaryButtonStyle())
+                                    .disabled(model.checkingCallingDiagnostics)
+                                }
+                                Text(model.callingDiagnosticStatus)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
 
                             Divider()

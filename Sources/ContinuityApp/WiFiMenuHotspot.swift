@@ -39,6 +39,8 @@ import CoreWLAN
     @Published var sipDisabled: Bool?
     @Published var status = "Not set up."
     private var loop: Task<Void, Never>?
+    private var vnodeSource: DispatchSourceFileSystemObject?
+    private var prefetchTask: Task<Void, Never>?
     private var handling = false
     private let joiner = HotspotJoiner()
     private var joinOperation: Task<Void, Never>?
@@ -46,6 +48,7 @@ import CoreWLAN
     private var installation: Task<Void, Never>?
     /// Wired by LabModel: the live session and the device it targets.
     var liveSession: (() -> (session: ClipboardSession, address: String, name: String)?)?
+    var requestReconnect: (() -> Void)?
     var center: HotspotCenter?
     var capability: HotspotCapabilityMemory?
     var note: ((String) -> Void)?
@@ -88,6 +91,8 @@ import CoreWLAN
     private func applyEnabled() {
         guard !installing else { return }
         loop?.cancel(); loop = nil
+        prefetchTask?.cancel(); prefetchTask = nil
+        stopDirectoryWatcher()
         let requested = enabled
         if !requested {
             joinOperation?.cancel()
@@ -119,11 +124,11 @@ import CoreWLAN
             if let failure { self.disableInternally("Wi-Fi menu integration is off. " + failure); return }
             guard requested else { self.status = "Off. The stock Wi-Fi menu has been restored."; return }
             self.status = "Wi-Fi menu integration active."
+            self.startDirectoryWatcher()
             self.loop = Task { [weak self] in
-                var tick = 0
                 while !Task.isCancelled {
-                    await self?.poll(tick: tick); tick += 1
-                    do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                    await self?.pollHeartbeat()
+                    do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
                 }
             }
         }
@@ -133,13 +138,44 @@ import CoreWLAN
         internalChange = true; enabled = false; internalChange = false
         status = message
     }
-    private func poll(tick: Int) async {
-        publishAvailability(tick: tick)
-        guard !handling else { return }
-        if FileManager.default.fileExists(atPath: Self.menuOpenedFile.path) { removeFile(Self.menuOpenedFile) ; await prefetch() }
+    private func startDirectoryWatcher() {
+        stopDirectoryWatcher()
+        let fd = open(Self.directory.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .attrib], queue: .main)
+        source.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in await self?.handleIPCChanges() }
+        }
+        source.setCancelHandler { close(fd) }
+        vnodeSource = source
+        source.resume()
+    }
+    private func stopDirectoryWatcher() {
+        vnodeSource?.cancel()
+        vnodeSource = nil
+    }
+    private func pollHeartbeat() async {
+        publishAvailability()
+        await handleIPCChanges()
+    }
+    private func handleIPCChanges() async {
         if FileManager.default.fileExists(atPath: Self.triggerFile.path) {
-            handling = true
-            joinOperation = Task { await handleTrigger() }
+            prefetchTask?.cancel(); prefetchTask = nil
+            if !handling {
+                handling = true
+                joinOperation = Task { await handleTrigger() }
+            }
+            return
+        }
+        guard !handling else { return }
+        if FileManager.default.fileExists(atPath: Self.menuOpenedFile.path) {
+            removeFile(Self.menuOpenedFile)
+            if prefetchTask == nil {
+                prefetchTask = Task { [weak self] in
+                    await self?.prefetch()
+                    self?.prefetchTask = nil
+                }
+            }
         }
     }
 
@@ -148,17 +184,18 @@ import CoreWLAN
     /// The hook only shows the entry while `available` is fresh, so a phone
     /// that left (session down) or a known hotspot-less device never appears.
     /// Refreshed every 5 s — the hook treats it as stale after 10 s.
-    private func publishAvailability(tick: Int) {
-        guard tick % 10 == 0 else { return }
+    private func publishAvailability(forceConnectedSSID: String? = nil) {
         guard let capability else { return }
-        guard let live = liveSession?(), center?.information(address: live.address) != nil, !capability.unavailable(live.address) else {
+        guard let live = liveSession?(), !capability.unavailable(live.address) else {
             removeFile(Self.availableFile)
             return
         }
+        let knownSSID = forceConnectedSSID ?? center?.lastSSID(address: live.address) ?? ""
+        let isConnected = forceConnectedSSID != nil || (!knownSSID.isEmpty && CWWiFiClient.shared().interface()?.ssid() == knownSSID)
         let payload: [String: Any] = [
             "name": live.name, "battery": center?.information(address: live.address)?.batteryPercent ?? -1,
-            "ssid": center?.lastSSID(address: live.address) ?? "",
-            "connected": center?.lastSSID(address: live.address).map { CWWiFiClient.shared().interface()?.ssid() == $0 } ?? false
+            "ssid": knownSSID,
+            "connected": isConnected
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: Self.statusFile, options: .atomic); try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statusFile.path) }
         FileManager.default.createFile(atPath: Self.availableFile.path, contents: nil, attributes: [.modificationDate: Date(), .posixPermissions: 0o600])
@@ -179,6 +216,27 @@ import CoreWLAN
             note?("Wi-Fi menu opened: refreshed the hotspot answer from \(live.name).")
         } catch { note?("Wi-Fi menu prefetch: \(error.localizedDescription)") }
     }
+    private func waitForLiveSession(timeout: TimeInterval) async -> (session: ClipboardSession, address: String, name: String)? {
+        if let live = liveSession?() { return live }
+        requestReconnect?()
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline && !Task.isCancelled {
+            do { try await Task.sleep(nanoseconds: 200_000_000) } catch { return nil }
+            if let live = liveSession?() { return live }
+        }
+        return nil
+    }
+    private func isAlreadyJoinedToKnownHotspot(expectedSSID: String? = nil, address: String? = nil) -> String? {
+        guard let currentSSID = CWWiFiClient.shared().interface()?.ssid(), !currentSSID.isEmpty else { return nil }
+        if let expectedSSID, !expectedSSID.isEmpty, currentSSID == expectedSSID { return currentSSID }
+        if let address, let last = center?.lastSSID(address: address), !last.isEmpty, currentSSID == last { return currentSSID }
+        if let data = try? Data(contentsOf: Self.statusFile),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let storedSSID = json["ssid"] as? String, !storedSSID.isEmpty, currentSSID == storedSSID {
+            return currentSSID
+        }
+        return nil
+    }
     /// The entry was clicked: reuse a fresh cached answer, else ask once over
     /// the existing session, then hand the credentials to the hook.
     private func handleTrigger() async {
@@ -186,19 +244,61 @@ import CoreWLAN
         guard let data = try? Data(contentsOf: Self.triggerFile),
               let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let id = request["id"] as? String, UUID(uuidString: id) != nil else { return }
-        guard let live = liveSession?(), let center, let capability else { writeResult(id: id, joined: false, message: "No authenticated Galaxy session is available."); return }
-        var answer = center.cached(address: live.address)
+        guard let center, let capability else { writeResult(id: id, joined: false, message: "No authenticated Galaxy session is available."); return }
+        guard var live = await waitForLiveSession(timeout: 8.0) else {
+            if let joinedSSID = isAlreadyJoinedToKnownHotspot() {
+                publishAvailability(forceConnectedSSID: joinedSSID)
+                writeResult(id: id, joined: true)
+                note?("Connected to the Galaxy hotspot from the Wi-Fi menu.")
+                return
+            }
+            writeResult(id: id, joined: false, message: "No authenticated Galaxy session is available.")
+            return
+        }
+        let cachedAnswer = center.cached(address: live.address)
+        let usedCachedAnswer = (cachedAnswer != nil)
+        var answer = cachedAnswer
         if answer == nil { answer = try? await live.session.requestHotspotAnswer(timeout: 15) }
-        guard let answer else { writeResult(id: id, joined: false, message: "The phone did not answer the hotspot request."); return }
+        if answer == nil {
+            // A pre-sleep BLE socket can drop right as a wake click arrives: trigger
+            // a fresh reconnect and retry the hotspot query once.
+            let staleSession = live.session
+            requestReconnect?()
+            let reconnectDeadline = Date().addingTimeInterval(4.0)
+            while Date() < reconnectDeadline && !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 200_000_000) } catch { break }
+                if let candidate = liveSession?(), candidate.session !== staleSession {
+                    live = candidate
+                    answer = try? await live.session.requestHotspotAnswer(timeout: 12)
+                    break
+                }
+            }
+        }
+        guard let answer else {
+            if let joinedSSID = isAlreadyJoinedToKnownHotspot(address: live.address) {
+                publishAvailability(forceConnectedSSID: joinedSSID)
+                writeResult(id: id, joined: true)
+                note?("Connected to the Galaxy hotspot from the Wi-Fi menu.")
+                return
+            }
+            writeResult(id: id, joined: false, message: "The phone did not answer the hotspot request.")
+            return
+        }
         center.store(address: live.address, credentials: answer)
         if answer.isSuccess == true { capability.markAvailable(live.address) } else { capability.markUnavailable(live.address, reason: answer.mhsfailed_reason) }
         do {
             guard enabled else { throw CancellationError() }
-            try await joiner.join(answer)
-            publishAvailability(tick: 0)
+            try await joiner.join(answer, wasCached: usedCachedAnswer)
+            publishAvailability(forceConnectedSSID: answer.ssid)
             writeResult(id: id, joined: true)
             note?("Connected to the Galaxy hotspot from the Wi-Fi menu.")
         } catch {
+            if let joinedSSID = isAlreadyJoinedToKnownHotspot(expectedSSID: answer.ssid, address: live.address) {
+                publishAvailability(forceConnectedSSID: joinedSSID)
+                writeResult(id: id, joined: true)
+                note?("Connected to the Galaxy hotspot from the Wi-Fi menu.")
+                return
+            }
             writeResult(id: id, joined: false, message: error.localizedDescription)
             note?("Wi-Fi menu connection: " + error.localizedDescription)
         }
@@ -332,26 +432,22 @@ import CoreWLAN
     private func removeFile(_ url: URL) { try? FileManager.default.removeItem(at: url) }
 }
 
-struct WiFiMenuHotspotCard: View {
+struct WiFiMenuHotspotSection: View {
     @ObservedObject var wifiMenu: WiFiMenuHotspot
     var body: some View {
-        OneUICard {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("macOS Wi-Fi menu", systemImage: "wifi").font(.headline)
-                Text("Show the connected Galaxy as a native Personal Hotspot in the macOS Wi-Fi menu. Experimental: needs SIP disabled and restarts the menu apps once. Status checks do not enable tethering. Only the two Wi-Fi menu agents are injected, while a Galaxy session is live.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Toggle("Integrate with the Wi-Fi menu", isOn: $wifiMenu.enabled).toggleStyle(OneUIAlignedSwitchStyle()).disabled(wifiMenu.installing)
-                    Spacer()
-                    Button("Check SIP") { wifiMenu.refreshSIP() }.buttonStyle(OneUISecondaryButtonStyle())
-                }
-                if let sip = wifiMenu.sipDisabled {
-                    Label(sip ? "SIP is disabled — hook allowed." : "SIP is enabled — macOS will block the hook.",
-                          systemImage: sip ? "checkmark.shield" : "lock.shield")
-                        .font(.caption).foregroundStyle(sip ? Color.green : Color.orange)
-                }
-                Text(wifiMenu.status).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 10) {
+            Label("macOS Wi-Fi menu (Hotspot & Battery)", systemImage: "wifi").font(.headline)
+            Text("Show the connected Galaxy as a native Personal Hotspot with its battery level in the macOS Wi-Fi menu. Experimental: needs SIP disabled and restarts the menu agents once. Status checks do not enable tethering. Only the two Wi-Fi menu agents are injected, while a Galaxy session is live.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle("Integrate with the Wi-Fi menu", isOn: $wifiMenu.enabled)
+                .toggleStyle(OneUIAlignedSwitchStyle())
+                .disabled(wifiMenu.installing)
+            if let sip = wifiMenu.sipDisabled {
+                Label(sip ? "SIP is disabled — Wi-Fi menu hook allowed." : "SIP is enabled — macOS will block the Wi-Fi menu hook.",
+                      systemImage: sip ? "checkmark.shield" : "lock.shield")
+                    .font(.caption).foregroundStyle(sip ? Color.green : Color.orange)
             }
+            Text(wifiMenu.status).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 }

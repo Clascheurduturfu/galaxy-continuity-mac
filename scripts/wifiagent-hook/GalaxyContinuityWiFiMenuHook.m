@@ -1,4 +1,4 @@
-// GalaxyContinuityWiFiMenuHook.m — v7
+// GalaxyContinuityWiFiMenuHook.m — v8
 //
 // Shows the user's Samsung Galaxy under the native macOS Wi-Fi menu's
 // "Personal Hotspots" section and joins it when clicked. Loaded through
@@ -176,6 +176,7 @@ static void GCLSwap(Class cls, SEL selector, IMP implementation, IMP *original) 
 
 static IMP gcl_orig_startBrowsing;
 static __weak id gcl_agent;
+static __weak id gcl_hotspotSession;
 static void gcl_hook_startBrowsing(id self, SEL _cmd, id reply) {
     gcl_agent = self;
     GCLLog(@"tether browsing started");
@@ -185,6 +186,8 @@ static void gcl_hook_startBrowsing(id self, SEL _cmd, id reply) {
 
 static IMP gcl_orig_updatedFoundDevices;
 static void gcl_hook_updatedFoundDevices(id self, SEL _cmd, id session, NSArray *devices) {
+    gcl_agent = self;
+    if (session) gcl_hotspotSession = session;
     devices = [devices filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id device, NSDictionary *bindings) { return !GCLIsOurDevice(device); }]];
     GCLStatus st = GCLLoadStatus();
     if (st.ok && !GCLConnectedToHotspot()) {
@@ -255,7 +258,7 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
     while (published && NSProcessInfo.processInfo.systemUptime < deadline) {
         NSDictionary *candidate = GCLReadJSON(@"creds.json");
         if ([candidate[@"id"] isEqual:requestID]) { result = candidate; break; }
-        usleep(100000);
+        usleep(20000);
     }
     if (result) GCLRemove(@"creds.json");
     BOOL ok = [result[@"joined"] boolValue];
@@ -265,18 +268,36 @@ static BOOL gcl_hook_connectTether(id self, SEL _cmd, id device, BOOL remember, 
     }
     flock(lock, LOCK_UN); close(lock);
     GCLLog(@"app hotspot association ok=%d", ok);
-    if (ok) dispatch_async(dispatch_get_main_queue(), ^{
+    if (ok) {
         id agent = gcl_agent;
-        // Rebuild from the filtered caches after the real Wi-Fi join; this
-        // drops an already-visible placeholder without reopening the menu.
-        for (NSString *name in @[@"__updateUIState", @"postDisplayedScanResults"]) {
-            SEL selector = NSSelectorFromString(name);
-            if ([agent respondsToSelector:selector]) {
-                @try { ((void (*)(id, SEL))objc_msgSend)(agent, selector); }
-                @catch (NSException *exception) { GCLLog(@"menu refresh unavailable"); }
+        id session = gcl_hotspotSession;
+        dispatch_queue_t targetQueue = dispatch_get_main_queue();
+        if (agent) {
+            for (NSString *qName in @[@"__queue", @"queue"]) {
+                SEL qSel = NSSelectorFromString(qName);
+                if ([agent respondsToSelector:qSel]) {
+                    id rawQ = ((id (*)(id, SEL))objc_msgSend)(agent, qSel);
+                    if (rawQ) { targetQueue = (dispatch_queue_t)rawQ; break; }
+                }
             }
         }
-    });
+        dispatch_async(targetQueue, ^{
+            // Evict the placeholder SFRemoteHotspotDevice from WiFiAgent's live session
+            // and rebuild displayed scan results so the Personal Hotspots spinner drops immediately.
+            if (agent && gcl_orig_updatedFoundDevices && session) {
+                @try {
+                    ((void (*)(id, SEL, id, NSArray *))gcl_orig_updatedFoundDevices)(agent, NSSelectorFromString(@"session:updatedFoundDevices:"), session, @[]);
+                } @catch (NSException *exception) { GCLLog(@"tether session clear unavailable"); }
+            }
+            for (NSString *name in @[@"__updateUIState", @"postDisplayedScanResults"]) {
+                SEL selector = NSSelectorFromString(name);
+                if ([agent respondsToSelector:selector]) {
+                    @try { ((void (*)(id, SEL))objc_msgSend)(agent, selector); }
+                    @catch (NSException *exception) { GCLLog(@"menu refresh unavailable"); }
+                }
+            }
+        });
+    }
     return ok;
 }
 

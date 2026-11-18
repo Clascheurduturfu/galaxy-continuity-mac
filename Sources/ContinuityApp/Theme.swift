@@ -3,8 +3,8 @@ import AppKit
 
 public enum AppVersion {
     public static let appName = "Galaxy Continuity"
-    public static let short = "1.1-rc.3"
-    public static let display = "v1.1 RC3"
+    public static let short = "1.2-rc.4"
+    public static let display = "v1.2 RC4"
     public static let full = display
     public static var isRenderingDemo: Bool { CommandLine.arguments.contains("--render-screenshots") }
     public static var isWindowSelfTest: Bool { CommandLine.arguments.contains("--window-lifecycle-selftest") }
@@ -99,17 +99,19 @@ public struct OneUIStatusPill: View {
 public struct OneUICard<Content: View>: View {
     @Environment(\.colorScheme) private var scheme
     private let padding: CGFloat
+    private let fillHeight: Bool
     private let content: Content
 
-    public init(padding: CGFloat = 20, @ViewBuilder content: () -> Content) {
+    public init(padding: CGFloat = 20, fillHeight: Bool = false, @ViewBuilder content: () -> Content) {
         self.padding = padding
+        self.fillHeight = fillHeight
         self.content = content()
     }
 
     public var body: some View {
         content
             .padding(padding)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: fillHeight ? .infinity : nil, alignment: .topLeading)
             .background(
                 RoundedRectangle(cornerRadius: OneUI.cardRadius, style: .continuous)
                     .fill(OneUI.cardBackground(scheme))

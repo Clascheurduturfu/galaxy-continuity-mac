@@ -147,7 +147,6 @@ struct HotspotsPage: View {
                 if peers.isEmpty {
                     OneUICard { Text("No nearby phone or tablet detected. Turn on Bluetooth and Samsung Auto Hotspot on the device. Wi-Fi-only tablets cannot provide mobile tethering.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.vertical, 22) }
                 }
-                WiFiMenuHotspotCard(wifiMenu: model.wifiMenu)
                 OneUICard {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(hotspots.status).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

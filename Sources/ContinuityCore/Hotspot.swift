@@ -7,7 +7,7 @@ import CoreLocation
     private var permission: CheckedContinuation<Void, Error>?
     public var progress: ((String) -> Void)?
     public override init() { super.init() }
-    public func join(_ credentials: HotspotCredentials) async throws {
+    public func join(_ credentials: HotspotCredentials, wasCached: Bool = false) async throws {
         try Task.checkCancellation()
         guard permission == nil else { throw ContinuityError.message("A Wi-Fi permission request is already pending.") }
         let manager = CLLocationManager(); location = manager; manager.delegate = self
@@ -20,14 +20,32 @@ import CoreLocation
         guard manager.authorizationStatus == .authorizedAlways else {
             throw ContinuityError.message("Allow Galaxy Continuity Lab in System Settings → Privacy & Security → Location Services so macOS can find the phone's Wi-Fi network.")
         }
-        for attempt in 0..<12 {
+        guard credentials.isSuccess == true, let ssid = credentials.ssid, !ssid.isEmpty, credentials.password != nil else {
+            throw ContinuityError.message("The phone did not return hotspot credentials (reason \(credentials.mhsfailed_reason ?? -1)).")
+        }
+        // Fast path 1: already associated to the target hotspot SSID.
+        if CWWiFiClient.shared().interface()?.ssid() == ssid { return }
+        // Fast path 2: try macOS's cached scan results before paying for an active full-band scan.
+        if let _ = try? await Task.detached(priority: .userInitiated, operation: {
+            try credentials.joinCachedOnly()
+        }).value {
+            return
+        }
+        try Task.checkCancellation()
+        // When the phone just toggled its SoftAP on, give beacons a 600 ms head start
+        // so the first active scan catches it instead of wasting ~4s on an empty scan.
+        if !wasCached {
+            progress?("Waiting briefly for the phone's hotspot radio…")
+            try await Task.sleep(nanoseconds: 600_000_000)
+        }
+        for attempt in 0..<16 {
             try Task.checkCancellation()
-            do { try await Task.detached { try credentials.join() }.value; return }
+            do { try await Task.detached(priority: .userInitiated) { try credentials.join() }.value; return }
             catch {
                 if Task.isCancelled { throw CancellationError() }
-                if attempt == 11 { throw error }
+                if attempt == 15 { throw error }
                 progress?("Waiting for the phone's hotspot to become visible…")
-                try await Task.sleep(nanoseconds: 1_500_000_000)
+                try await Task.sleep(nanoseconds: 450_000_000)
             }
         }
     }
@@ -50,12 +68,62 @@ public struct HotspotCredentials: Decodable, Sendable {
         // conservative 2.4/5 GHz and WPA2 capabilities.
         try JSONSerialization.data(withJSONObject: ["version": 1, "messagetype": 3, "membertype": 1, "clientsupportedhighband": 5, "clientsupportedband": 3, "wpa3personalsupport": 0, "owesupport": 0])
     }
+    public static func selectBestNetwork<C: Collection>(
+        _ networks: C,
+        ssid: String,
+        networkSSID: (C.Element) -> String?,
+        rssi: (C.Element) -> Int
+    ) -> C.Element? {
+        networks.filter { networkSSID($0) == ssid }.max { rssi($0) < rssi($1) }
+    }
+
+    public static func selectBestNetwork(_ networks: Set<CWNetwork>, ssid: String) -> CWNetwork? {
+        selectBestNetwork(networks, ssid: ssid, networkSSID: \.ssid, rssi: \.rssiValue)
+    }
+
+    public func joinCachedOnly() throws {
+        guard isSuccess == true, let ssid, !ssid.isEmpty, let password else {
+            throw ContinuityError.message("The phone did not return hotspot credentials (reason \(mhsfailed_reason ?? -1)).")
+        }
+        guard let interface = CWWiFiClient.shared().interface() else {
+            throw ContinuityError.message("No Mac Wi-Fi interface is available.")
+        }
+        if interface.ssid() == ssid { return }
+        guard let cached = interface.cachedScanResults(),
+              let network = Self.selectBestNetwork(cached, ssid: ssid) else {
+            throw ContinuityError.message("Hotspot not in cached scan results.")
+        }
+        try associateAndConfirm(interface: interface, network: network, ssid: ssid, password: password, confirmSeconds: 1.0)
+    }
+
     public func join() throws {
         guard isSuccess == true, let ssid, !ssid.isEmpty, let password else { throw ContinuityError.message("The phone did not return hotspot credentials (reason \(mhsfailed_reason ?? -1)).") }
         guard let interface = CWWiFiClient.shared().interface() else { throw ContinuityError.message("No Mac Wi-Fi interface is available.") }
+        if interface.ssid() == ssid { return }
         let networks = try interface.scanForNetworks(withSSID: Data(ssid.utf8))
-        guard let network = networks.first(where: { $0.ssid == ssid }) else { throw ContinuityError.message("The phone enabled its hotspot, but the Mac cannot find its Wi-Fi network. Check Wi-Fi and macOS location permission.") }
-        try interface.associate(to: network, password: password)
+        guard let network = Self.selectBestNetwork(networks, ssid: ssid) else { throw ContinuityError.message("The phone enabled its hotspot, but the Mac cannot find its Wi-Fi network. Check Wi-Fi and macOS location permission.") }
+        try associateAndConfirm(interface: interface, network: network, ssid: ssid, password: password, confirmSeconds: 3.0)
+    }
+
+    private func associateAndConfirm(interface: CWInterface, network: CWNetwork, ssid: String, password: String, confirmSeconds: TimeInterval) throws {
+        do {
+            try interface.associate(to: network, password: password)
+        } catch let associateError {
+            // If macOS airportd auto-join was concurrently associating to this same
+            // known hotspot SSID, associate() can fail while the link completes anyway.
+            let settleDeadline = Date().addingTimeInterval(2.0)
+            while interface.ssid() != ssid && Date() < settleDeadline {
+                if Task.isCancelled { throw CancellationError() }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if interface.ssid() == ssid { return }
+            throw associateError
+        }
+        let deadline = Date().addingTimeInterval(confirmSeconds)
+        while interface.ssid() != ssid && Date() < deadline {
+            if Task.isCancelled { throw CancellationError() }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         guard interface.ssid() == ssid else { throw ContinuityError.message("Wi-Fi association did not complete.") }
     }
 }

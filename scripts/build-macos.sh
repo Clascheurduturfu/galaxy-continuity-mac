@@ -15,8 +15,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.galaxy-continuity-lab</string>
 <key>CFBundleName</key><string>Galaxy Continuity</string>
 <key>CFBundleDisplayName</key><string>Galaxy Continuity</string>
-<key>CFBundleShortVersionString</key><string>1.1-rc.3</string>
-<key>CFBundleVersion</key><string>1.1-rc.3</string>
+<key>CFBundleShortVersionString</key><string>1.2-rc.4</string>
+<key>CFBundleVersion</key><string>1.2-rc.4</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -27,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSContactsUsageDescription</key><string>Show your Mac contacts locally when you choose Load Contacts. Selecting a number fills the dialer; contacts are never uploaded.</string>
 <key>NSLocationUsageDescription</key><string>macOS requires location permission to find and join your phone's Wi-Fi hotspot.</string>
 <key>NSLocationWhenInUseUsageDescription</key><string>Find your Galaxy phone's Wi-Fi hotspot when you choose Connect using phone.</string>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>Telephony URL</string><key>CFBundleURLSchemes</key><array><string>tel</string></array></dict></array>
 </dict></plist>
 PLIST
 mkdir -p "$APP/Contents/Resources/Notices"
@@ -35,5 +36,6 @@ iconutil -c icns -o "$APP/Contents/Resources/AppIcon.icns" .build/AppIcon.iconse
 cp docs/THIRD_PARTY_NOTICES.md docs/third-party/samsung-re-health-LICENSE.txt "$APP/Contents/Resources/Notices/"
 cp docs/third-party/calling-*-LICENSE.txt "$APP/Contents/Resources/Notices/"
 bash scripts/build-wifiagent-hook.sh
+bash scripts/build-phone-hook.sh
 codesign --force --sign - --requirements '=designated => identifier "local.galaxy-continuity-lab"' "$APP"
 cp .build/release/continuity dist/continuity

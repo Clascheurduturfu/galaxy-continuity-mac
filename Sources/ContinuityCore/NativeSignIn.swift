@@ -103,6 +103,16 @@ struct SamsungHTTPError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+public enum CallingTokenPolicy {
+    public static func shouldInvalidateAndRetry(status: Int) -> Bool {
+        status == 401 || status == 403
+    }
+
+    public static func shouldTreatAsMasterTokenExpired(status: Int, path: String) -> Bool {
+        path.hasSuffix("/oauth2/v2/authorize") && [400, 401, 403].contains(status)
+    }
+}
+
 private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
@@ -204,7 +214,15 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
         let result = try await request(secureServer.appendingPathComponent("auth/oauth2/authenticate"), form: ["grant_type": "authorization_code", "serviceType": "M", "client_id": Self.masterClient, "code": code, "code_verifier": verifier, "username": login, "physical_address_text": device])
         guard let token = (result["userauth_token"] ?? result["userAuthToken"]) as? String, let user = (result["userId"] ?? result["user_id"]) as? String, !token.isEmpty, !user.isEmpty else { throw ContinuityError.message("Samsung did not issue a reusable account connection.") }
         var credentials = NativeCredentials(authServer: "https://" + host, masterToken: token, userID: user, loginID: login, deviceID: device)
-        if let previous, previous.userID == user { credentials = previous; credentials.authServer = "https://" + host; credentials.masterToken = token; credentials.loginID = login }
+        if let previous, previous.userID == user {
+            credentials.registrationID = previous.registrationID
+            credentials.cloudAuthorization = previous.cloudAuthorization
+            credentials.cloudExpires = previous.cloudExpires
+            credentials.csr = previous.csr
+            credentials.privateKeyData = previous.privateKeyData
+            credentials.bluetoothAddress = previous.bluetoothAddress
+        }
+        invalidateCallingToken()
         try NativeAuthStore.save(credentials)
         return credentials
     }
@@ -246,20 +264,29 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
         }
         return ["x-sc-app-id": Self.continuityClient, "x-sc-app-version": "4.6.1217.0", "x-sc-uid": value.userID, "x-sc-access-token": value.accessToken, "x-sc-cdid": try identifier(value.deviceID + Self.continuityClient), "x-sc-pdid": try identifier(value.deviceID)]
     }
+    private func registerCloudCredentials(_ value: inout NativeCredentials) async throws {
+        let result = try await request(URL(string: "https://play.samsungcloud.com/identity/v2/user/register")!, json: ["app": ["version": "4.6.1217.0", "sdkVersion": "26100.0"], "device": ["osType": "win", "osVersion": "11", "platformVersion": "10.0.26100.0", "type": "pc", "countryCode": "FRA", "modelName": "Mac", "modelCode": "Mac", "alias": "Galaxy Continuity Lab for Mac", "osUserId": "0"]], headers: try identityHeaders(value))
+        guard let device = result["dvcId"] as? String, !device.isEmpty,
+              let tokens = result["tokens"] as? [[String: Any]], let token = tokens.first(where: { $0["type"] as? String == "user" }),
+              let access = token["accessToken"] as? String, !access.isEmpty else { throw ContinuityError.message("Samsung did not return the Continuity installation registration.") }
+        value.registrationID = device; value.cloudAuthorization = access; value.cloudExpires = Self.expiry(token)
+        try NativeAuthStore.save(value)
+    }
+
     private func cloudCredentials(_ original: NativeCredentials) async throws -> NativeCredentials {
         var value = try await serviceCredentials(original)
-        if value.registrationID.isEmpty {
-            let result = try await request(URL(string: "https://play.samsungcloud.com/identity/v2/user/register")!, json: ["app": ["version": "4.6.1217.0", "sdkVersion": "26100.0"], "device": ["osType": "win", "osVersion": "11", "platformVersion": "10.0.26100.0", "type": "pc", "countryCode": "FRA", "modelName": "Mac", "modelCode": "Mac", "alias": "Galaxy Continuity Lab for Mac", "osUserId": "0"]], headers: try identityHeaders(value))
-            guard let device = result["dvcId"] as? String, !device.isEmpty,
-                  let tokens = result["tokens"] as? [[String: Any]], let token = tokens.first(where: { $0["type"] as? String == "user" }),
-                  let access = token["accessToken"] as? String, !access.isEmpty else { throw ContinuityError.message("Samsung did not return the Continuity installation registration.") }
-            value.registrationID = device; value.cloudAuthorization = access; value.cloudExpires = Self.expiry(token)
-            try NativeAuthStore.save(value)
+        if value.registrationID.isEmpty || value.cloudAuthorization.isEmpty {
+            try await registerCloudCredentials(&value)
         } else if value.cloudExpires < Date().addingTimeInterval(120) {
             var headers = try identityHeaders(value); headers.removeValue(forKey: "x-sc-cdid"); headers.removeValue(forKey: "x-sc-pdid"); headers["x-sc-dvc-id"] = value.registrationID
-            let token = try await request(URL(string: "https://play.samsungcloud.com/identity/v2/user/token/renew")!, json: ["previousToken": value.cloudAuthorization], headers: headers)
-            guard let access = token["accessToken"] as? String, !access.isEmpty else { throw ContinuityError.message("Samsung did not renew the Continuity cloud token.") }
-            value.cloudAuthorization = access; value.cloudExpires = Self.expiry(token); try NativeAuthStore.save(value)
+            do {
+                let token = try await request(URL(string: "https://play.samsungcloud.com/identity/v2/user/token/renew")!, json: ["previousToken": value.cloudAuthorization], headers: headers)
+                guard let access = token["accessToken"] as? String, !access.isEmpty else { throw ContinuityError.message("Samsung did not renew the Continuity cloud token.") }
+                value.cloudAuthorization = access; value.cloudExpires = Self.expiry(token); try NativeAuthStore.save(value)
+            } catch let error as SamsungHTTPError where [400, 401, 403].contains(error.status) {
+                value.registrationID = ""; value.cloudAuthorization = ""; value.cloudExpires = .distantPast
+                try await registerCloudCredentials(&value)
+            }
         }
         return value
     }
@@ -302,9 +329,13 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
     public func signIn(status: (String) -> Void) async throws -> ContinuityProfile { try await enroll(accountSignIn(status: status), status: status) }
     public func refresh(status: (String) -> Void, renewTokens: Bool = false) async throws -> ContinuityProfile {
         guard var value = try NativeAuthStore.loadIfPresent() else { throw ContinuityError.message("Sign in with Samsung first.") }
-        if renewTokens { value.accessExpires = .distantPast; value.cloudExpires = .distantPast }
+        if renewTokens {
+            value.accessExpires = .distantPast; value.cloudExpires = .distantPast
+            invalidateCallingToken()
+        }
         return try await enroll(value, status: status)
     }
+    public func invalidateCallingToken() { try? CredentialFiles.delete("samsung-calls.json") }
     public func signOut() throws { web?.cancel(); web = nil; try NativeAuthStore.delete(); try CredentialFiles.delete("samsung-calls.json") }
     public nonisolated func hasStoredSignIn() throws -> Bool { try NativeAuthStore.loadIfPresent() != nil }
     /// Account label for local UI only. Credentials and tokens never leave the store.
@@ -363,38 +394,46 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
         }
         return try probeResult.get()
     }
-    func callingContext(status: (String) -> Void) async throws -> CallingAccountContext {
+    func callingContext(status: (String) -> Void, forceRefresh: Bool = false) async throws -> CallingAccountContext {
         struct CallingToken: Codable { var user: String; var device: String; var access: String; var refresh: String; var expires: Date }
         guard let account = try NativeAuthStore.loadIfPresent() else { throw ContinuityError.message("Sign in with Samsung first.") }
+        guard let user = account.userID.addingPercentEncoding(withAllowedCharacters: .alphanumerics) else { throw ContinuityError.message("Invalid calling account.") }
         let appID = "8f9l37bswj"
-        var saved = try CredentialFiles.load("samsung-calls.json").flatMap { try? JSONDecoder().decode(CallingToken.self, from: $0) }
-        if saved?.user != account.userID || saved?.device != account.deviceID || (saved?.expires ?? .distantPast) < Date().addingTimeInterval(120) {
+
+        func authorizeFreshToken() async throws -> CallingToken {
             status("Requesting Samsung Phone authorization for this Mac…")
             let verifier = ContinuityAuthCrypto.url64(try ContinuityAuthCrypto.random(32))
             var target = URLComponents(string: account.authServer + "/auth/oauth2/v2/authorize")!
             // Phone's client rejects Galaxy Connect's offline.access scope;
             // request its registered default scopes and renew through account SSO.
             target.queryItems = ["response_type": "code", "serviceType": "M", "client_id": appID, "code_challenge": ContinuityAuthCrypto.challenge(verifier), "code_challenge_method": "S256", "childAccountSupported": "Y", "userauth_token": account.masterToken, "physical_address_text": account.deviceID, "login_id": account.loginID].sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
-            let authorization = try await request(target.url!)
+            let authorization: [String: Any]
+            do {
+                authorization = try await request(target.url!)
+            } catch let error as SamsungHTTPError where CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: error.status, path: error.path) {
+                throw ContinuityError.message("Samsung sign-in expired. Open Settings → Account and click Sign In with Samsung.")
+            }
             guard let code = authorization["code"] as? String, !code.isEmpty else { throw ContinuityError.message("Samsung Phone needs additional authorization; no calling device has been registered.") }
             let token = try await request(URL(string: account.authServer + "/auth/oauth2/token")!, form: ["grant_type": "authorization_code", "code": code, "client_id": appID, "client_secret": "", "physical_address_text": account.deviceID, "code_verifier": verifier])
             guard let access = token["access_token"] as? String, !access.isEmpty else { throw ContinuityError.message("Samsung did not issue Phone authorization.") }
             let seconds = (token["expires_in"] as? NSNumber)?.doubleValue ?? Double(token["expires_in"] as? String ?? "") ?? 3600
-            saved = CallingToken(user: account.userID, device: account.deviceID, access: access, refresh: token["refresh_token"] as? String ?? "", expires: Date().addingTimeInterval(seconds))
-            try CredentialFiles.save(JSONEncoder().encode(saved!), name: "samsung-calls.json")
+            let minted = CallingToken(user: account.userID, device: account.deviceID, access: access, refresh: token["refresh_token"] as? String ?? "", expires: Date().addingTimeInterval(seconds))
+            try CredentialFiles.save(JSONEncoder().encode(minted), name: "samsung-calls.json")
+            return minted
         }
-        guard let saved, let user = account.userID.addingPercentEncoding(withAllowedCharacters: .alphanumerics) else { throw ContinuityError.message("Invalid calling account.") }
-        let headers = ["Access-Token": saved.access, "Auth-Server-Url": URL(string: account.authServer)!.host!, "Auth-Device-Id": account.deviceID, "x-osp-clientosversion": "macOS", "x-osp-clientmodel": "Mac", "x-osp-appId": appID, "x-osp-packagename": "com.samsung.android.mdecservice", "x-osp-packageversion": "1.0.0"]
-        status("Samsung Phone authorized. Checking its account service…")
-        let local = try await request(URL(string: "https://acs.samsungmdec.com/1.0/users/\(user)/localacsaddress")!, headers: headers)
-        guard let name = local["local_acs_address"] as? String, !name.contains("/"), let server = URL(string: "https://" + name) else { throw ContinuityError.message("Samsung returned an invalid calling service address.") }
-        let entitlement = try await request(server.appendingPathComponent("1.0/defaultentitlementserveraddress"), headers: headers)
-        guard let address = entitlement["entitlement_server_address"] as? String, let es = URL(string: address) else { throw ContinuityError.message("Samsung returned no calling account service.") }
-        let info = try await request(es.appendingPathComponent("1.0/users/\(user)"), headers: headers)
-        let lines = info["line"] as? [[String: Any]] ?? []
-        guard lines.count == 1, let line = lines.first, let id = line["line_id"] as? String, !id.contains("/"), !id.isEmpty else {
-            throw ContinuityError.message("Calling setup needs exactly one selected phone line.")
-        }
+
+        func fetchContext(using saved: CallingToken) async throws -> CallingAccountContext {
+            let headers = ["Access-Token": saved.access, "Auth-Server-Url": URL(string: account.authServer)!.host!, "Auth-Device-Id": account.deviceID, "x-osp-clientosversion": "macOS", "x-osp-clientmodel": "Mac", "x-osp-appId": appID, "x-osp-packagename": "com.samsung.android.mdecservice", "x-osp-packageversion": "1.0.0"]
+            status("Samsung Phone authorized. Checking its account service…")
+            let local = try await request(URL(string: "https://acs.samsungmdec.com/1.0/users/\(user)/localacsaddress")!, headers: headers)
+            guard let name = local["local_acs_address"] as? String, !name.contains("/"), let server = URL(string: "https://" + name) else { throw ContinuityError.message("Samsung returned an invalid calling service address.") }
+            let entitlement = try await request(server.appendingPathComponent("1.0/defaultentitlementserveraddress"), headers: headers)
+            guard let address = entitlement["entitlement_server_address"] as? String, let es = URL(string: address) else { throw ContinuityError.message("Samsung returned no calling account service.") }
+            let info = try await request(es.appendingPathComponent("1.0/users/\(user)"), headers: headers)
+            let lines = info["line"] as? [[String: Any]] ?? []
+            guard lines.count == 1, let line = lines.first, let id = line["line_id"] as? String, !id.contains("/"), !id.isEmpty else {
+                throw ContinuityError.message("Calling setup needs exactly one selected phone line.")
+            }
             var configHeaders = headers
             let devices = line["device"] as? [[String: Any]] ?? []
             guard let primary = devices.first(where: { $0["device_type"] as? String == "Phone" }), let identifier = primary["device_id"] as? String else {
@@ -406,6 +445,20 @@ private final class AuthRedirectGuard: NSObject, URLSessionTaskDelegate {
             let servers = config["pcscf_address_list"] as? [String] ?? []
             return CallingAccountContext(userID: account.userID, installationID: account.deviceID, lineID: id,
                                          primaryID: identifier, servers: servers, headers: headers, entitlement: es, devices: devices)
+        }
+
+        let cached = forceRefresh ? nil : try CredentialFiles.load("samsung-calls.json").flatMap { try? JSONDecoder().decode(CallingToken.self, from: $0) }
+        let usableCache = cached.flatMap { token in
+            (token.user == account.userID && token.device == account.deviceID && token.expires >= Date().addingTimeInterval(120)) ? token : nil
+        }
+        if let usableCache {
+            do {
+                return try await fetchContext(using: usableCache)
+            } catch let error as SamsungHTTPError where CallingTokenPolicy.shouldInvalidateAndRetry(status: error.status) {
+                invalidateCallingToken()
+            }
+        }
+        return try await fetchContext(using: try await authorizeFreshToken())
     }
 }
 

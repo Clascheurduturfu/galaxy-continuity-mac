@@ -106,6 +106,7 @@ import ContinuityCore
 
     private func quit() {
         // Unregister before exiting, but never wait more than 4 s.
+        PhoneAppBridge.shared.shutdownForQuit()
         var done = false
         Task { await calls.shutdownForQuit(); done = true }
         let deadline = Date().addingTimeInterval(4)
@@ -113,6 +114,7 @@ import ContinuityCore
     }
 
     private func callStateChanged(_ state: CallingCallState) {
+        if PhoneAppBridge.shared.isHandlingCallsNatively { hide(); return }
         guard case .incoming(let who) = state else { hide(); return }
         show(caller: who)
     }

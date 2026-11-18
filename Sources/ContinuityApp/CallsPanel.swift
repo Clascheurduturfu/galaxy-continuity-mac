@@ -5,32 +5,21 @@ import ContinuityCore
 
 @MainActor final class CallsModel: ObservableObject {
     let calls = CallingController.shared
-    @Published var samsungStatus = "Samsung Call & Text on Other Devices (CMC) registers this Mac over Wi-Fi and the Internet."
     @Published var callNumber = ""
-    @Published var checkingSamsung = false
     private var bag = Set<AnyCancellable>()
 
     func start() {
         calls.objectWillChange
             .sink { [weak self] _ in DispatchQueue.main.async { self?.objectWillChange.send() } }
             .store(in: &bag)
-    }
-
-    func checkSamsung(transport: Bool = false) {
-        guard !checkingSamsung else { return }
-        checkingSamsung = true
-        Task {
-            defer { checkingSamsung = false }
-            do {
-                if transport {
-                    samsungStatus = try await ContinuitySignIn.shared.checkCallingTransport(status: { self.samsungStatus = $0 })
-                } else {
-                    samsungStatus = try await ContinuitySignIn.shared.checkCallingAccount(status: { self.samsungStatus = $0 })
-                }
-            } catch {
-                samsungStatus = error.localizedDescription
+        PhoneAppBridge.shared.$pendingDialerNumber
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] pending in
+                guard let self, let pending, !pending.isEmpty else { return }
+                self.callNumber = pending
+                PhoneAppBridge.shared.pendingDialerNumber = nil
             }
-        }
+            .store(in: &bag)
     }
 
     func tapKey(_ digit: Character) {
@@ -101,11 +90,17 @@ struct CallsPanel: View {
                                 .textSelection(.enabled)
                         }
                         Spacer()
-                        Button(model.calls.phase == .stopped ? "Turn On Calling" : "Turn Off") {
-                            if model.calls.phase == .stopped { model.calls.start() } else { model.calls.stop() }
+                        HStack(spacing: 8) {
+                            if case .failed = model.calls.phase {
+                                Button("Retry") { model.calls.retryNow() }
+                                    .buttonStyle(OneUIPrimaryButtonStyle(tint: OneUI.blue))
+                            }
+                            Button(model.calls.phase == .stopped ? "Turn On Calling" : "Turn Off") {
+                                if model.calls.phase == .stopped { model.calls.start() } else { model.calls.stop() }
+                            }
+                            .buttonStyle(OneUIPrimaryButtonStyle(tint: model.calls.phase == .stopped ? OneUI.blue : OneUI.red))
+                            .disabled(model.calls.phase == .enrolling || model.calls.phase == .connecting)
                         }
-                        .buttonStyle(OneUIPrimaryButtonStyle(tint: model.calls.phase == .stopped ? OneUI.blue : OneUI.red))
-                        .disabled(model.calls.phase == .enrolling || model.calls.phase == .connecting)
                     }
                 }
 
@@ -133,7 +128,7 @@ struct CallsPanel: View {
                 }
 
                 HStack(alignment: .top, spacing: 20) {
-                    OneUICard {
+                    OneUICard(fillHeight: true) {
                         VStack(alignment: .leading, spacing: 14) {
                             Text("Keypad & Dialer")
                                 .font(.system(size: 15, weight: .semibold))
@@ -209,33 +204,12 @@ struct CallsPanel: View {
                     }
                     .frame(maxWidth: 340)
 
-                    VStack(alignment: .leading, spacing: 18) {
-                        ContactsPicker(number: $model.callNumber)
-                        CallDiagnosticsCard(model: model)
-                    }
+                    ContactsPicker(number: $model.callNumber)
                 }
+                .fixedSize(horizontal: false, vertical: true)
             }
             .padding(28)
         }
         .task { model.start() }
-    }
-}
-
-private struct CallDiagnosticsCard: View {
-    @ObservedObject var model: CallsModel
-    var body: some View {
-        OneUICard {
-            DisclosureGroup("Connection diagnostics") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("The Mac and phone can use different Internet connections. Samsung Call & text on other devices must be enabled on the phone.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Button(model.checkingSamsung ? "Checking…" : "Check Calling Account") { model.checkSamsung() }
-                        .buttonStyle(OneUISecondaryButtonStyle()).disabled(model.checkingSamsung)
-                    Button("Check Calling Server") { model.checkSamsung(transport: true) }
-                        .buttonStyle(OneUISecondaryButtonStyle()).disabled(model.checkingSamsung)
-                    Text(model.samsungStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                }.padding(.top, 12)
-            }
-        }
     }
 }

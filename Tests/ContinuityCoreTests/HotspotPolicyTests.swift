@@ -45,4 +45,19 @@ import XCTest
         XCTAssertNil(unknown.batteryPercent)
         XCTAssertLessThanOrEqual(HotspotCapabilityMemory.trustWindow, 120, "-6 means Auto Hotspot is disabled, not unsupported hardware")
     }
+
+    func testSelectBestNetworkPicksStrongestMatchingSSID() {
+        struct Candidate { let ssid: String?; let rssi: Int }
+        let scan = [
+            Candidate(ssid: "OtherNet", rssi: -30),
+            Candidate(ssid: "GalaxyHotspot", rssi: -78),
+            Candidate(ssid: "GalaxyHotspot", rssi: -45),
+            Candidate(ssid: "GalaxyHotspot", rssi: -62),
+            Candidate(ssid: nil, rssi: -20)
+        ]
+        let best = HotspotCredentials.selectBestNetwork(scan, ssid: "GalaxyHotspot", networkSSID: \.ssid, rssi: \.rssi)
+        XCTAssertEqual(best?.ssid, "GalaxyHotspot")
+        XCTAssertEqual(best?.rssi, -45)
+        XCTAssertNil(HotspotCredentials.selectBestNetwork(scan, ssid: "Missing", networkSSID: \.ssid, rssi: \.rssi))
+    }
 }

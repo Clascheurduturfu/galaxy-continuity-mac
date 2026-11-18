@@ -8,33 +8,38 @@ extension ContinuitySignIn {
     /// Enrolls this Mac's own `pc_` device for the lifetime of a foreground calling session.
     /// A private journal (same file the registration test uses) lets a later run remove the entry after a crash.
     /// Only this Mac's own device id is ever added or removed.
-    func acquireCallingLease(status: (String) -> Void) async throws -> CallingAccountContext {
-        let context = try await callingContext(status: status)
+    func acquireCallingLease(status: (String) -> Void, forceRefresh: Bool = false) async throws -> CallingAccountContext {
+        let context = try await callingContext(status: status, forceRefresh: forceRefresh)
         let collection = context.entitlement.appendingPathComponent("1.0/users/\(context.userID)/lines/\(context.lineID)/devices")
         let ownURL = collection.appendingPathComponent(context.deviceID)
         var removeHeaders = context.headers; removeHeaders["Auth-Device-Id"] = context.deviceID
         var present = context.devices.contains { $0["device_id"] as? String == context.deviceID }
-        if let data = try CredentialFiles.load(Self.callingJournal),
-           let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any], entry["device"] as? String == context.deviceID {
-            status("Removing a leftover Mac calling enrollment from an earlier run…")
-            do { _ = try await request(ownURL, headers: removeHeaders, method: "DELETE") }
-            catch let error as SamsungHTTPError where error.status == 404 {}
-            try CredentialFiles.delete(Self.callingJournal)
-            present = false
-        }
-        if present {
-            // Present without a journal: it is this Mac's own deterministic id, so reuse it and own its removal.
-            status("Reusing this Mac's existing calling enrollment.")
-        } else {
-            status("Registering this Mac as a calling device…")
-            let added = try await request(collection, json: context.enrollment, headers: context.headers)
-            guard (added["response"] as? [String: Any])?["result"] as? Bool == true else {
-                throw ContinuityError.message("Samsung did not accept the Mac calling enrollment.")
+        do {
+            if let data = try CredentialFiles.load(Self.callingJournal),
+               let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any], entry["device"] as? String == context.deviceID {
+                status("Removing a leftover Mac calling enrollment from an earlier run…")
+                do { _ = try await request(ownURL, headers: removeHeaders, method: "DELETE") }
+                catch let error as SamsungHTTPError where error.status == 404 {}
+                try CredentialFiles.delete(Self.callingJournal)
+                present = false
             }
+            if present {
+                // Present without a journal: it is this Mac's own deterministic id, so reuse it and own its removal.
+                status("Reusing this Mac's existing calling enrollment.")
+            } else {
+                status("Registering this Mac as a calling device…")
+                let added = try await request(collection, json: context.enrollment, headers: context.headers)
+                guard (added["response"] as? [String: Any])?["result"] as? Bool == true else {
+                    throw ContinuityError.message("Samsung did not accept the Mac calling enrollment.")
+                }
+            }
+            let journal = try JSONSerialization.data(withJSONObject: ["device": context.deviceID, "url": ownURL.absoluteString])
+            try CredentialFiles.save(journal, name: Self.callingJournal)
+            return context
+        } catch let error as SamsungHTTPError where !forceRefresh && CallingTokenPolicy.shouldInvalidateAndRetry(status: error.status) {
+            invalidateCallingToken()
+            return try await acquireCallingLease(status: status, forceRefresh: true)
         }
-        let journal = try JSONSerialization.data(withJSONObject: ["device": context.deviceID, "url": ownURL.absoluteString])
-        try CredentialFiles.save(journal, name: Self.callingJournal)
-        return context
     }
 
     /// Removes only this Mac's own calling device. Throws if Samsung has not confirmed the removal (journal is kept).
@@ -51,7 +56,9 @@ extension ContinuitySignIn {
     }
 
     /// Fresh token/server view, used by re-REGISTER.
-    func freshCallingContext() async throws -> CallingAccountContext { try await callingContext(status: { _ in }) }
+    func freshCallingContext(forceRefresh: Bool = false) async throws -> CallingAccountContext {
+        try await callingContext(status: { _ in }, forceRefresh: forceRefresh)
+    }
 }
 
 // MARK: - Controller
@@ -63,6 +70,30 @@ public enum CallingPhase: Equatable {
 
 public enum CallingCallState: Equatable {
     case idle, dialing, ringing, incoming(String), connecting, active, ending
+}
+
+public enum CallingSystemRecoveryReason: Equatable, Sendable {
+    case wake
+    case networkReady(signature: String)
+    case networkUnavailable
+}
+
+public enum CallingReconnectPolicy {
+    static let backoffSeconds: [UInt64] = [1, 2, 4, 8, 15, 30, 60]
+    static let rapidReconnectingAttempts = 5
+
+    public static func delaySeconds(forAttempt attempt: Int) -> UInt64 {
+        let clamped = max(0, min(attempt, backoffSeconds.count - 1))
+        return backoffSeconds[clamped]
+    }
+
+    public static func shouldSurfaceFailure(forAttempt attempt: Int) -> Bool {
+        attempt >= rapidReconnectingAttempts
+    }
+
+    public static func shouldKeepRetrying(hasStoredSignIn: Bool) -> Bool {
+        hasStoredSignIn
+    }
 }
 
 public enum CallingIncomingPolicy {
@@ -80,6 +111,10 @@ public enum CallingIncomingPolicy {
     @Published public private(set) var status = "Calling is off."
     @Published public private(set) var muted = false
     @Published public private(set) var callStart: Date?
+    @Published public private(set) var activeRemoteNumber = ""
+    @Published public private(set) var activeCallerName = ""
+    @Published public private(set) var lastDisconnectReasonCode = 0
+    public var contactNameLookup: (@MainActor (String) -> String?)?
     public var incomingPolicy: CallingIncomingPolicy = .interactive
     /// Counts, never content: (REGISTER 200s, server requests seen outside dialogs, incoming INVITEs).
     public private(set) var registerCount = 0
@@ -104,7 +139,13 @@ public enum CallingIncomingPolicy {
     private var dialog: CallingDialog?
     private var offeredCryptos: [CallingSDPCrypto] = []
     private var stopping = false
-    private var reconnectTask: Task<Void, Never>?
+    private var autoRetryEnabled = false
+    private var retryTask: Task<Void, Never>?
+    private var wakeVerifyTask: Task<Void, Never>?
+    private var retryGeneration: UInt64 = 0
+    private var retryAttempt = 0
+    private var isConnectingAttempt = false
+    private var lastNetworkSignature = ""
     private var userSetMuted = false
     private let mediaQueue = DispatchQueue(label: "calling.media", qos: .userInteractive)
     #if canImport(CallingMediaC)
@@ -124,33 +165,92 @@ public enum CallingIncomingPolicy {
     public func start() {
         if case .failed = phase {} else if phase != .stopped { return }
         UserDefaults.standard.set(true, forKey: Self.enabledKey)
+        autoRetryEnabled = true
         stopping = false
+        retryTask?.cancel(); retryTask = nil
+        wakeVerifyTask?.cancel(); wakeVerifyTask = nil
+        retryGeneration &+= 1
+        retryAttempt = 0
         Task { await bringUp() }
     }
 
     /// Starts and waits until registered or failed. Used by the CLI.
     public func startAndWait() async throws {
+        autoRetryEnabled = false
         stopping = false
+        retryTask?.cancel(); retryTask = nil
         await bringUp()
         if case .failed(let message) = phase { throw ContinuityError.message(message) }
     }
 
-    private func bringUp() async {
+    private func makeRegistrar(context: CallingAccountContext) -> CallingRegistrar {
+        let registrar = CallingRegistrar(context: context) { try await ContinuitySignIn.shared.freshCallingContext() }
+        registrar.onRequest = { [weak self] in self?.serverRequest($0) }
+        registrar.onClosed = { [weak self] error in self?.connectionLost(error) }
+        registrar.onNotify = { [weak self] _ in self?.objectWillChange.send() }
+        return registrar
+    }
+
+    private func resolveCallingContext(existing: CallingAccountContext?) async throws -> CallingAccountContext {
+        if let existing {
+            do {
+                return try await ContinuitySignIn.shared.freshCallingContext()
+            } catch let error as SamsungHTTPError where CallingTokenPolicy.shouldInvalidateAndRetry(status: error.status) {
+                ContinuitySignIn.shared.invalidateCallingToken()
+                self.context = nil
+                return try await ContinuitySignIn.shared.acquireCallingLease { self.status = $0 }
+            } catch {
+                // Only fall back to an in-memory context on transient connectivity issues when cached creds still exist.
+                return existing
+            }
+        }
+        phase = retryAttempt > 0 ? .reconnecting : .enrolling
+        status = "Preparing this Mac for Samsung calling…"
+        return try await ContinuitySignIn.shared.acquireCallingLease { self.status = $0 }
+    }
+
+    private func bringUp(expectedGeneration: UInt64? = nil, allowTokenRecovery: Bool = true) async {
+        guard !stopping else { return }
+        if let expectedGeneration, retryGeneration != expectedGeneration { return }
+        isConnectingAttempt = true
+        defer { isConnectingAttempt = false }
         do {
-            phase = .enrolling; status = "Preparing this Mac for Samsung calling…"
-            let context = try await ContinuitySignIn.shared.acquireCallingLease { self.status = $0 }
-            self.context = context
-            let registrar = CallingRegistrar(context: context) { try await ContinuitySignIn.shared.freshCallingContext() }
-            registrar.onRequest = { [weak self] in self?.serverRequest($0) }
-            registrar.onClosed = { [weak self] error in self?.connectionLost(error) }
-            registrar.onNotify = { [weak self] _ in self?.objectWillChange.send() }
+            let ctx = try await resolveCallingContext(existing: self.context)
+            guard !stopping, expectedGeneration == nil || retryGeneration == expectedGeneration else { return }
+            self.context = ctx
+            let oldRegistrar = self.registrar
+            oldRegistrar?.onClosed = nil
+            self.registrar = nil
+            if let oldRegistrar { _ = await oldRegistrar.stop() }
+            guard !stopping, expectedGeneration == nil || retryGeneration == expectedGeneration else { return }
+
+            let registrar = makeRegistrar(context: ctx)
             self.registrar = registrar
-            phase = .connecting
-            try await registrar.connectAndRegister { self.status = $0 }
-            registerCount = registrar.registerCount
+            phase = retryAttempt > 0 ? .reconnecting : .connecting
+            try await registrar.connectAndRegister(serverIndex: retryAttempt) { self.status = $0 }
+            guard !stopping, expectedGeneration == nil || retryGeneration == expectedGeneration else {
+                _ = await registrar.stop()
+                return
+            }
+            registerCount = max(registerCount + 1, registrar.registerCount)
+            retryAttempt = 0
             phase = .registered; status = "Ready for calls on this Mac."
             holdActivity()
+        } catch CallingRegistrar.RegistrarError.tokenRejected where allowTokenRecovery && !stopping {
+            ContinuitySignIn.shared.invalidateCallingToken()
+            self.context = nil
+            self.registrar = nil
+            isConnectingAttempt = false
+            await bringUp(expectedGeneration: expectedGeneration, allowTokenRecovery: false)
         } catch {
+            guard !stopping, expectedGeneration == nil || retryGeneration == expectedGeneration else { return }
+            if autoRetryEnabled {
+                let hasSignIn = (try? ContinuitySignIn.shared.hasStoredSignIn()) ?? false
+                if CallingReconnectPolicy.shouldKeepRetrying(hasStoredSignIn: hasSignIn) {
+                    scheduleRetry(afterError: error)
+                    return
+                }
+            }
             status = error.localizedDescription
             phase = .failed(error.localizedDescription)
             await tearDown(removeEnrollment: true)
@@ -165,14 +265,97 @@ public enum CallingIncomingPolicy {
         return registrar.expires
     }
 
+    /// Triggers an immediate retry if currently disconnected or waiting in backoff.
+    public func retryNow() {
+        guard !stopping, autoRetryEnabled || (self === Self.shared && Self.wantsAutostart) else { return }
+        autoRetryEnabled = true
+        if isConnectingAttempt { return }
+        switch phase {
+        case .failed, .reconnecting, .stopped:
+            retryTask?.cancel(); retryTask = nil
+            retryGeneration &+= 1
+            retryAttempt = 0
+            phase = .reconnecting
+            status = "Reconnecting Samsung calling…"
+            Task { await bringUp() }
+        case .enrolling, .connecting, .registered:
+            break
+        }
+    }
+
+    /// Recovers or verifies calling registration after Mac wake or a network path change.
+    public func recoverAfterSystemEvent(_ reason: CallingSystemRecoveryReason) {
+        if reason == .networkUnavailable {
+            lastNetworkSignature = ""
+            return
+        }
+        guard !stopping else { return }
+        if !autoRetryEnabled, self === Self.shared, Self.wantsAutostart {
+            autoRetryEnabled = true
+        }
+        guard autoRetryEnabled else { return }
+
+        var networkChanged = false
+        if case .networkReady(let sig) = reason {
+            guard !sig.isEmpty else { return }
+            networkChanged = sig != lastNetworkSignature
+            lastNetworkSignature = sig
+        }
+
+        switch phase {
+        case .stopped, .failed, .reconnecting:
+            retryNow()
+        case .registered:
+            if reason == .wake || networkChanged {
+                guard callState == .idle else { return }
+                verifyConnectionAfterSystemEvent()
+            }
+        case .enrolling, .connecting:
+            break
+        }
+    }
+
+    private func verifyConnectionAfterSystemEvent() {
+        wakeVerifyTask?.cancel()
+        wakeVerifyTask = Task { [weak self] in
+            guard let self else { return }
+            guard !self.stopping, self.phase == .registered, self.callState == .idle, let registrar = self.registrar else { return }
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        try await registrar.reregister()
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 6_000_000_000)
+                        throw ContinuityError.message("Calling connection did not respond after network change.")
+                    }
+                    try await group.next()
+                    group.cancelAll()
+                }
+                guard !Task.isCancelled, !self.stopping else { return }
+                self.registerCount = registrar.registerCount
+                self.status = "Ready for calls on this Mac."
+            } catch {
+                guard !Task.isCancelled, !self.stopping else { return }
+                CallingDiagnostics.shared.log("wake/network probe failed: \(error.localizedDescription)")
+                self.connectionLost(error)
+            }
+        }
+    }
+
     public func stop() {
         UserDefaults.standard.set(false, forKey: Self.enabledKey)
+        autoRetryEnabled = false
         Task { await stopAndWait() }
     }
 
     /// Hangs up, unregisters (Expires: 0) and removes this Mac's calling enrollment.
     public func stopAndWait() async {
-        stopping = true; reconnectTask?.cancel()
+        stopping = true
+        autoRetryEnabled = false
+        retryGeneration &+= 1
+        retryTask?.cancel(); retryTask = nil
+        wakeVerifyTask?.cancel(); wakeVerifyTask = nil
         dialog?.hangUp()
         try? await Task.sleep(nanoseconds: 300_000_000)
         endMedia()
@@ -205,28 +388,47 @@ public enum CallingIncomingPolicy {
 
     private func connectionLost(_ error: Error?) {
         guard !stopping else { return }
+        wakeVerifyTask?.cancel(); wakeVerifyTask = nil
         endMedia()
         if let dialog, dialog.state != .terminated { dialog.transportLost() }
         callState = .idle
-        phase = .reconnecting; status = "Calling connection lost. Reconnecting…"
-        reconnectTask?.cancel()
-        reconnectTask = Task { [weak self] in
-            var delay: UInt64 = 1
-            for attempt in 0..<20 {
-                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
-                guard let self, !Task.isCancelled, !self.stopping, let context = self.context else { return }
-                do {
-                    let registrar = CallingRegistrar(context: (try? await ContinuitySignIn.shared.freshCallingContext()) ?? context) { try await ContinuitySignIn.shared.freshCallingContext() }
-                    registrar.onRequest = { [weak self] in self?.serverRequest($0) }
-                    registrar.onClosed = { [weak self] error in self?.connectionLost(error) }
-                    try await registrar.connectAndRegister(serverIndex: attempt)
-                    self.registrar = registrar; self.registerCount += 1
-                    self.phase = .registered; self.status = "Ready for calls on this Mac."
-                    return
-                } catch { delay = min(delay * 2, 10) }
-            }
-            self?.phase = .failed("Could not reconnect to Samsung calling.")
+        let stale = registrar
+        stale?.onClosed = nil
+        registrar = nil
+        if let stale { Task { _ = await stale.stop() } }
+        autoRetryEnabled = true
+        retryAttempt = 0
+        scheduleRetry(afterError: error)
+    }
+
+    private func scheduleRetry(afterError error: Error?) {
+        guard !stopping else { return }
+        let generation = retryGeneration &+ 1
+        retryGeneration = generation
+        retryTask?.cancel()
+
+        let currentAttempt = retryAttempt
+        retryAttempt += 1
+        let delay = CallingReconnectPolicy.delaySeconds(forAttempt: currentAttempt)
+        if CallingReconnectPolicy.shouldSurfaceFailure(forAttempt: currentAttempt) {
+            let reason = error?.localizedDescription ?? "Connection lost."
+            phase = .failed("Waiting to reconnect: \(reason)")
+            status = "Waiting for network to reconnect (retrying automatically)…"
+        } else {
+            phase = .reconnecting
+            status = "Calling connection lost. Reconnecting in \(delay)s…"
         }
+
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            guard let self, !Task.isCancelled, !self.stopping, self.retryGeneration == generation else { return }
+            await self.attemptReconnect(generation: generation)
+        }
+    }
+
+    private func attemptReconnect(generation: UInt64) async {
+        guard !stopping, retryGeneration == generation, !isConnectingAttempt else { return }
+        await bringUp(expectedGeneration: generation, allowTokenRecovery: true)
     }
 
     // MARK: Local network
@@ -243,10 +445,18 @@ public enum CallingIncomingPolicy {
 
     /// Places a real call. Only call this from an explicit user action.
     public func dial(number: String, slot: Int? = nil) {
+        if CallingEmergencyGuard.isEmergencyNumber(number) {
+            status = "Emergency calls cannot be routed through Samsung Continuity. Use a cellular phone."
+            return
+        }
         guard phase == .registered, callState == .idle, let registrar, let context, let dispatcher = registrar.dispatcher else {
             status = "Calling is not ready."; return
         }
         #if canImport(CallingMediaC)
+        let cleanNumber = CallingEmergencyGuard.sanitizeDigits(number)
+        activeRemoteNumber = cleanNumber
+        activeCallerName = (!cleanNumber.isEmpty ? contactNameLookup?(cleanNumber) : nil) ?? ""
+        lastDisconnectReasonCode = 0
         callState = .dialing; status = "Starting the call…"
         Task {
             do {
@@ -311,7 +521,14 @@ public enum CallingIncomingPolicy {
         case .info: break
         case .ended(let reason):
             endMedia()
+            switch reason {
+            case .localHangup, .cancelledByCaller: lastDisconnectReasonCode = 0
+            case .remoteHangup, .remoteCancelled: lastDisconnectReasonCode = 2
+            case .declined: lastDisconnectReasonCode = 7
+            case .failed, .timeout, .transportLost: lastDisconnectReasonCode = 1
+            }
             callState = .idle; callStart = nil
+            activeRemoteNumber = ""; activeCallerName = ""
             switch reason {
             case .failed(let code, let text): status = "Call failed (\(code) \(text))."
             case .remoteHangup: status = "Call ended."
@@ -386,8 +603,24 @@ public enum CallingIncomingPolicy {
         dialog.receiveInvite(request)
         self.dialog = dialog
         dialog.sendRinging()
-        let name = dialog.displayName
-        callState = .incoming(name.isEmpty ? "Unknown caller" : name)
+        let number = dialog.remoteNumber
+        let sipTextName = dialog.callerTextName
+        let resolvedName = (!number.isEmpty ? contactNameLookup?(number) : nil) ?? ""
+        let callerName = !resolvedName.isEmpty ? resolvedName : sipTextName
+        activeRemoteNumber = number
+        activeCallerName = callerName
+        lastDisconnectReasonCode = 0
+        let presented: String
+        if !callerName.isEmpty && !number.isEmpty {
+            presented = "\(callerName) (\(number))"
+        } else if !callerName.isEmpty {
+            presented = callerName
+        } else if !number.isEmpty {
+            presented = number
+        } else {
+            presented = "Unknown caller"
+        }
+        callState = .incoming(presented)
         status = "Incoming call."
     }
 

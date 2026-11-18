@@ -67,7 +67,82 @@ enum CallingDialogEvent {
     private var ackWatchdog: Task<Void, Never>?
     private var byeWatchdog: Task<Void, Never>?
     private(set) var remoteSDP: String?
-    var displayName: String { invite.flatMap { Self.displayName(of: $0.header("from") ?? "") } ?? "" }
+    var displayName: String {
+        if let from = invite?.header("from"), let name = Self.displayName(of: from) { return name }
+        if let pai = invite?.header("p-asserted-identity"), let name = Self.displayName(of: pai) { return name }
+        return ""
+    }
+
+    /// True when `raw` looks like a dialed/caller-ID phone number rather than a text CNAM or long CMC token.
+    public static func isPhoneNumberLike(_ raw: String) -> Bool {
+        normalizedPhoneNumber(fromDisplay: raw) != nil
+    }
+
+    private static func normalizedPhoneNumber(fromDisplay raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var candidate = trimmed
+        if candidate.lowercased().hasPrefix("tel:") {
+            candidate = String(candidate.dropFirst(4))
+        }
+        let allowed = CharacterSet(charactersIn: "+0123456789-(). ")
+        guard candidate.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        let digits = CallingEmergencyGuard.sanitizeDigits(candidate)
+        let numericCount = digits.filter(\.isNumber).count
+        // ITU-T E.164 max is 15 digits; reject 19+ digit opaque Samsung CMC subscriber tokens.
+        guard numericCount >= 2 && numericCount <= 18 else { return nil }
+        return digits
+    }
+
+    var remoteNumber: String {
+        guard let invite else { return "" }
+        // Samsung CMC carries the caller phone number in the From displayName while the
+        // SIP URI user-part carries a 50-digit CMC subscriber token. Prefer valid phone display names first.
+        if let fromName = Self.displayName(of: invite.header("from") ?? ""),
+           let fromPhone = Self.normalizedPhoneNumber(fromDisplay: fromName) {
+            return fromPhone
+        }
+        if let paiName = Self.displayName(of: invite.header("p-asserted-identity") ?? ""),
+           let paiPhone = Self.normalizedPhoneNumber(fromDisplay: paiName) {
+            return paiPhone
+        }
+        for headerName in ["p-asserted-identity", "from"] {
+            guard let rawHeader = invite.header(headerName),
+                  let uri = CallingSIPMessage.uri(of: rawHeader) else { continue }
+            if let extracted = Self.extractPhoneDigits(fromURI: uri),
+               extracted != ctx.userID,
+               !extracted.isEmpty {
+                return extracted
+            }
+        }
+        return ""
+    }
+
+    /// Non-numeric caller label from SIP signaling (empty when the display name is just the phone number or "unknown").
+    var callerTextName: String {
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name.lowercased() != "unknown",
+              Self.normalizedPhoneNumber(fromDisplay: name) == nil else { return "" }
+        return name
+    }
+
+    private static func extractPhoneDigits(fromURI uri: String) -> String? {
+        var working = uri
+        if let schemeRange = working.range(of: ":") {
+            working = String(working[schemeRange.upperBound...])
+        }
+        if let at = working.firstIndex(of: "@") {
+            working = String(working[..<at])
+        }
+        if let semi = working.firstIndex(of: ";") {
+            working = String(working[..<semi])
+        }
+        let digits = CallingEmergencyGuard.sanitizeDigits(working)
+        let numericCount = digits.filter(\.isNumber).count
+        guard numericCount >= 2 && numericCount <= 18 else { return nil }
+        return digits
+    }
 
     init(role: Role, context: CallingDialogContext, callID: String = CallingSIPBuild.token(24) + "@calls", transmit: @escaping (Data) -> Void) {
         self.role = role; self.ctx = context; self.callID = callID; self.transmit = transmit

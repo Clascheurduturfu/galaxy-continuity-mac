@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ContinuityCore
 
 @MainActor final class AppWindowPolicy {
     static let shared = AppWindowPolicy()
@@ -41,11 +42,36 @@ final class ContinuityAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         MainActor.assumeIsolated { AppWindowPolicy.shared.show() }; return true
     }
+    func application(_ application: NSApplication, open urls: [URL]) {
+        MainActor.assumeIsolated {
+            for url in urls where url.scheme?.lowercased() == "tel" {
+                let abs = url.absoluteString
+                let raw = abs.firstIndex(of: ":").map { String(abs[abs.index(after: $0)...]) } ?? abs
+                let beforeQuery = raw.split(separator: "?", maxSplits: 1).first.map(String.init) ?? raw
+                let beforeParams = beforeQuery.split(separator: ";", maxSplits: 1).first.map(String.init) ?? beforeQuery
+                let digits = CallingEmergencyGuard.sanitizeDigits(beforeParams)
+                guard !digits.isEmpty else { continue }
+                if CallingEmergencyGuard.isEmergencyNumber(digits) {
+                    PhoneAppBridge.shared.note?("Emergency calls cannot be routed through Samsung Continuity.")
+                    continue
+                }
+                PhoneAppBridge.shared.pendingDialerNumber = digits
+                AppWindowPolicy.shared.show(.calls)
+                break
+            }
+        }
+    }
 }
 
 struct MainWindowAttachment: NSViewRepresentable {
+    final class Coordinator { var attachedWindowNumber: Int? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSView { NSView() }
     func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async { if let window = nsView.window { AppWindowPolicy.shared.attach(window) } }
+        DispatchQueue.main.async {
+            guard let window = nsView.window, context.coordinator.attachedWindowNumber != window.windowNumber else { return }
+            context.coordinator.attachedWindowNumber = window.windowNumber
+            AppWindowPolicy.shared.attach(window)
+        }
     }
 }

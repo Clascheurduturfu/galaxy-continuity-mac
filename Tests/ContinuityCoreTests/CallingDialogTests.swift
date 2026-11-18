@@ -395,4 +395,81 @@ import XCTest
         XCTAssertEqual(dialog.state, .terminated); XCTAssertEqual(dialog.endReason, .localHangup)
     }
 
+    func testIncomingSamsungCMCIgnores50DigitLineTokenAndUsesDisplayPhoneNumber() throws {
+        let token50 = "99000000000000000000000000000000000000000000000001"
+        let raw = try CallingSIPMessage.encode("INVITE sip:abc@abc.invalid;transport=ws SIP/2.0", headers: [
+            ("Via", "SIP/2.0/TLS 198.51.100.1;branch=z9hG4bKcmc1"),
+            ("From", "\"+33600000001\" <sip:\(token50)@samsungims.com>;tag=rem1"),
+            ("P-Asserted-Identity", "<sip:\(token50)@samsungims.com>"),
+            ("To", "<sip:line1@samsungims.com>"),
+            ("Call-ID", "cmc-in-1@x"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:peer@198.51.100.1>")
+        ], body: Data("v=0\r\n".utf8))
+        var stream = CallingSIPStream(); try stream.append(raw)
+        let invite = try XCTUnwrap(stream.next())
+        let dialog = make(.callee, callID: "cmc-in-1@x")
+        dialog.receiveInvite(invite)
+        XCTAssertEqual(dialog.remoteNumber, "+33600000001")
+        XCTAssertEqual(dialog.callerTextName, "")
+    }
+
+    func testIncomingNamedCallerUsesTextNameAndShortTelOrPAINumber() throws {
+        let token50 = "99000000000000000000000000000000000000000000000001"
+        let raw = try CallingSIPMessage.encode("INVITE sip:abc@abc.invalid;transport=ws SIP/2.0", headers: [
+            ("Via", "SIP/2.0/TLS 198.51.100.1;branch=z9hG4bKcmc2"),
+            ("From", "\"Alice\" <sip:\(token50)@samsungims.com>;tag=rem2"),
+            ("P-Asserted-Identity", "<tel:+33612345678>"),
+            ("To", "<sip:line1@samsungims.com>"),
+            ("Call-ID", "cmc-in-2@x"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:peer@198.51.100.1>")
+        ], body: Data("v=0\r\n".utf8))
+        var stream = CallingSIPStream(); try stream.append(raw)
+        let invite = try XCTUnwrap(stream.next())
+        let dialog = make(.callee, callID: "cmc-in-2@x")
+        dialog.receiveInvite(invite)
+        XCTAssertEqual(dialog.remoteNumber, "+33612345678")
+        XCTAssertEqual(dialog.callerTextName, "Alice")
+
+        let anonRaw = try CallingSIPMessage.encode("INVITE sip:abc@abc.invalid;transport=ws SIP/2.0", headers: [
+            ("Via", "SIP/2.0/TLS 198.51.100.1;branch=z9hG4bKcmc3"),
+            ("From", "\"unknown\" <sip:\(token50)@samsungims.com>;tag=rem3"),
+            ("To", "<sip:line1@samsungims.com>"),
+            ("Call-ID", "cmc-in-3@x"),
+            ("CSeq", "1 INVITE")
+        ])
+        var anonStream = CallingSIPStream(); try anonStream.append(anonRaw)
+        let anonInvite = try XCTUnwrap(anonStream.next())
+        let anonDialog = make(.callee, callID: "cmc-in-3@x")
+        anonDialog.receiveInvite(anonInvite)
+        XCTAssertEqual(anonDialog.remoteNumber, "")
+        XCTAssertEqual(anonDialog.callerTextName, "")
+    }
+
+    func testReconnectPolicyBackoffAndFailureThreshold() {
+        XCTAssertEqual(CallingReconnectPolicy.delaySeconds(forAttempt: 0), 1)
+        XCTAssertEqual(CallingReconnectPolicy.delaySeconds(forAttempt: 1), 2)
+        XCTAssertEqual(CallingReconnectPolicy.delaySeconds(forAttempt: 4), 15)
+        XCTAssertEqual(CallingReconnectPolicy.delaySeconds(forAttempt: 12), 60)
+        XCTAssertFalse(CallingReconnectPolicy.shouldSurfaceFailure(forAttempt: 4))
+        XCTAssertTrue(CallingReconnectPolicy.shouldSurfaceFailure(forAttempt: 5))
+        XCTAssertTrue(CallingReconnectPolicy.shouldKeepRetrying(hasStoredSignIn: true))
+        XCTAssertFalse(CallingReconnectPolicy.shouldKeepRetrying(hasStoredSignIn: false))
+    }
+
+    func testCallingTokenPolicyClassification() {
+        XCTAssertTrue(CallingTokenPolicy.shouldInvalidateAndRetry(status: 401))
+        XCTAssertTrue(CallingTokenPolicy.shouldInvalidateAndRetry(status: 403))
+        XCTAssertFalse(CallingTokenPolicy.shouldInvalidateAndRetry(status: 200))
+        XCTAssertFalse(CallingTokenPolicy.shouldInvalidateAndRetry(status: 404))
+        XCTAssertFalse(CallingTokenPolicy.shouldInvalidateAndRetry(status: 500))
+
+        XCTAssertTrue(CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: 400, path: "/auth/oauth2/v2/authorize"))
+        XCTAssertTrue(CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: 401, path: "/auth/oauth2/v2/authorize"))
+        XCTAssertTrue(CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: 403, path: "/auth/oauth2/v2/authorize"))
+        XCTAssertFalse(CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: 500, path: "/auth/oauth2/v2/authorize"))
+        XCTAssertFalse(CallingTokenPolicy.shouldTreatAsMasterTokenExpired(status: 403, path: "/1.0/users/u1/localacsaddress"))
+    }
+
 }
